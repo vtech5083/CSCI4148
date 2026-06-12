@@ -1,0 +1,705 @@
+---
+title: 'Practical 2: Electronic Medical Records and NLP'
+author: "Vivekkumar Dudhat"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  message    = FALSE,
+  warning    = FALSE,
+  cache      = TRUE,
+  fig.width  = 9,
+  fig.height = 5
+)
+
+set.seed(42)  # global seed for reproducibility
+
+library(here)        # reproducible file paths
+library(tidyverse)   # dplyr, ggplot2, stringr, tidyr, readr, forcats
+library(tidytext)    # tidy text mining
+library(SnowballC)   # Porter stemmer
+library(textstem)    # lemmatization
+library(clinspacy)   # MTSamples dataset
+library(topicmodels) # Latent Dirichlet Allocation
+library(scales)      # axis label helpers
+library(sessioninfo) # session reproducibility report
+library(reshape2)    # data reshaping library
+```
+
+If the above code-block errors, install any missing libraries (`install.packages(c('LIBRARYNAME1', 'LIBRARYNAME2'))`)
+
+## Introduction
+
+This practical explores natural language processing (NLP) of unstructured clinical free-text from electronic medical records (EMR). You will work through an analysis going from raw text to an unsupervised topic model using the `MTSamples` medical transcription dataset.
+
+The analyses you will do mirror some of those taken in the assigned readings and refer back to them for some questions:
+
+- **Sun et al. (2024)** (Latent Dirichlet Allocation (LDA)-based topic modelling for clinical social work notes)
+- **Chung et al. (2024)** (GPT-4 Turbo for classifying perioperative outcomes from pre-operative notes).
+
+**Learning objectives:** by the end of this practical you should understand how to:
+
+- apply regular expressions to search clinical free-text
+- tokenise, normalise, stem, and lemmatize medical text
+- compute TF-IDF to identify specialty-discriminating terms
+- build a document-term matrix and fit an LDA topic model on clinical notes
+- compare traditional NLP with LLM-based approaches
+
+------------------------------------------------------------------------
+
+## Data Loading and Exploration
+
+This lab is going to use the `MTSamples` medical transcription dataset. You can find the original source of this data [here](https://www.mtsamples.com/) (ignore any HTTP vs HTTPS related warnings).
+
+```{r load-data}
+raw_data <- dataset_mtsamples()
+glimpse(raw_data)
+```
+
+I've not supplied a data dictionary with this dataset. This is a VERY common situation with real EMR data.
+
+**Q1a (2 marks):** Based on the `glimpse()` output create a simple data dictionary (variable name with a 1-2 sentence explanation of the variable).
+
+| Variable | Type | Description |
+|----|----|----|
+| `note_id` | integer | A unique numeric identifier for each clinical note. Acts as the primary key for the dataset. |
+| `description` | character | A brief one-sentence summary of the patient encounter or chief complaint. |
+| `medical_specialty` | character | The clinical specialty associated with the transcription. Used to group notes by clinical domain. |
+| `sample_name` | character | The name of the specific procedure, report type, or encounter. More specific than `medical_specialty`. |
+| `transcription` | character | The full free-text body of the clinical note. This is the primary text used for NLP analysis throughout the practical. |
+| `keywords` | character | A comma-separated string of clinical keywords associated with the note, likely assigned by the original transcriptionist or editor. |
+
+**Q1b (2 marks):** What sort of information are you missing about how this dataset was created that could be important to your analyses?
+
+(1) The **time period** the notes were collected and whether they reflect current clinical practice.
+
+(2) The **patient population and institutions** the notes were drawn from, which raises questions about demographic and regional bias.
+
+(3) Whether and **how the notes were de-identified** (what was redacted or altered, and whether that altered the text).
+
+(4) The **selection process** — whether transcripts were randomly sampled or curated, which affects representativeness.
+
+(5) Whether `keywords` were human-assigned or derived algorithmically, which affects their reliability as labels.
+
+**Q1c (2 marks):** How many distinct medical specialties are represented? What are the most common 5? Create a ggplot bar graph showing how many transcripts come from each specialty.
+
+- **40 distinct specialties** are represented.
+- **Top 5:** Surgery (1103), Consult - History and Phy. (516), Cardiovascular / Pulmonary (372), Orthopedic (355), Radiology (273).
+
+```{r specialty-bar}
+#dplyr and ggplot code to count how many medical specialties are represented in the dataset and create a bar graph of them
+
+# Number of unique specialties
+raw_data |>
+  summarise(unique_specialties = n_distinct(medical_specialty)) |>
+  knitr::kable()
+
+```
+
+```{r}
+
+# Count per specialty
+raw_data |>
+  count(medical_specialty, sort = TRUE) |>
+  knitr::kable()
+```
+
+```{r}
+# Bar chart
+raw_data |>
+  count(medical_specialty, sort = TRUE) |>
+  ggplot(aes(n, reorder(medical_specialty, n))) +
+  geom_col() +
+  labs(
+    title = "Number of transcripts per medical specialty",
+    x = "Number of transcripts",
+    y = NULL
+  )
+```
+
+To make patterns slightly easier to interpret for the sake of learning, we will simplify our dataset down to just transcripts from three specialties that have relatively distinct clinical vocabularies: neurological medicine, musculoskeletal/orthopaedic, and diagnostic imaging. In real analyses this is something you would have to infer from the data as part of your exploratory data analysis.
+
+```{r filter-data}
+filtered_data <- raw_data |>
+  filter(medical_specialty %in% c("Orthopedic", "Radiology", "Neurology"))
+
+count(filtered_data, medical_specialty)
+```
+
+------------------------------------------------------------------------
+
+## Regular Expressions
+
+Now we are going to learn how to use the `stringr` library for regular expressions in R. Regular expressions (regex) enable flexible pattern-based searches over text. As discussed in the lecture, they are widely used in NLP (including as part of the framework around LLM systems) for finding measurements, medications, and semi- structured values embedded in free-text.
+
+Key `stringr` functions:
+
+| Function                  | Purpose                           |
+|---------------------------|-----------------------------------|
+| `str_detect(x, pat)`      | Returns `TRUE`/`FALSE` per string |
+| `str_count(x, pat)`       | Number of non-overlapping matches |
+| `str_extract(x, pat)`     | First match                       |
+| `str_extract_all(x, pat)` | All matches (returns a list)      |
+
+Key regex special characters (in R strings, backslashes must be doubled — e.g., `\d` is written `\\d`):
+
+| Pattern | Meaning | Example match |
+|----|----|----|
+| `\\d` | Any digit `[0-9]` | `"120"` in `"120 mg"` |
+| `\\D` | Any non-digit | `"mg"` in `"120 mg"` |
+| `\\w` | Word character `[a-zA-Z0-9_]` | `"bp"` in `"bp_value"` |
+| `\\W` | Non-word character | `" "` in `"120 mg"` |
+| `\\s` | Whitespace (space, tab, newline) | `" "` in `"120 mg"` |
+| `\\S` | Non-whitespace | `"120"` in `"120 mg"` |
+| `\\b` | Word boundary | matches position between `"120"` and `" "` |
+| `.` | Any character except newline | `"1"`, `"a"`, `"/"` |
+| `^` | Start of string | `"BP"` in `"BP: 120/80"` |
+| `$` | End of string | `"mmHg"` at end of `"120/80 mmHg"` |
+| `*` | 0 or more of preceding | `"\\d*"` matches `""` or `"123"` |
+| `+` | 1 or more of preceding | `"\\d+"` matches `"1"` or `"123"` |
+| `?` | 0 or 1 of preceding (optional) | `"mmHg?"` matches `"mmH"` or `"mmHg"` |
+| `{n}` | Exactly *n* of preceding | `"\\d{3}"` matches `"120"` |
+| `{n,m}` | Between *n* and *m* of preceding | `"\\d{2,3}"` matches `"12"` or `"120"` |
+| `[abc]` | Any one character in set | `"[aeiou]"` matches any vowel |
+| `[^abc]` | Any character *not* in set | `"[^0-9]"` matches non-digits |
+| `(a\|b)` | Either `a` or `b` | `"(mg\|mcg)"` matches `"mg"` or `"mcg"` |
+| `( )` | Capture group | `"(\\d+) mg"` captures the number |
+| `[:alpha:]` | Any letter (POSIX class) | equivalent to `[a-zA-Z]` |
+| `[:digit:]` | Any digit (POSIX class) | equivalent to `\\d` |
+| `[:alnum:]` | Any letter or digit | equivalent to `[a-zA-Z0-9]` |
+| `[:space:]` | Any whitespace (POSIX class) | equivalent to `\\s` |
+| `[:punct:]` | Any punctuation character | `"."`, `","`, `"!"` |
+
+### Finding blood pressure measurements
+
+Blood pressure is typically recorded as systolic/diastolic (e.g., "120/80" or "130/85 mmHg"). We can therefore look for a pair of 2-3 digit numbers (`\\d{2,3}`) separated by a `/` (i.e., `\\d{2,3}/\\d{2,3}`) optionally followed by a pressure-related `mmHg` unit (with or without a preceding space `\\s*`). The special regex characters like `\\d` and `\\s` have that extra `\` so they are "escaped" and not treated as a literal character.
+
+```{r regex-bp}
+bp_pattern <- "\\d{2,3}/\\d{2,3}(\\s*mmHg)?"
+
+
+filtered_data |>
+  mutate(has_bp = str_detect(transcription, bp_pattern)) |>
+  count(medical_specialty, has_bp) |>
+  pivot_wider(names_from = has_bp, values_from = n,
+              names_prefix = "bp_") |>
+  mutate(pct_with_bp = percent(bp_TRUE / (bp_TRUE + bp_FALSE),
+                                       accuracy = 0.1))
+```
+
+### Counting medication dosages
+
+Now let's look for medication doses. We can make a regex that finds one of the standard dosage units (e.g., `mg` `mcg`, `ml`, `mL` `unit`) preceded by some sort of number (`\\d+`) with or without a decimal point (`\\.?\\d*`).
+
+```{r regex-dose}
+dose_pattern <- "\\d+\\.?\\d*\\s*(mg|mcg|ml|mL|units?)"
+
+filtered_data |>
+    mutate(n_doses = str_count(transcription, dose_pattern)) |>
+    filter(n_doses > 0) |>
+    group_by(medical_specialty) |>
+    summarise(mean_doses   = round(mean(n_doses), 1),
+              median_doses = median(n_doses))
+```
+
+**Q2 (3 marks):** Write a regular expression to find temperature measurements in clinical text (e.g., "98.6 F", "37.2°C", "temperature of 38.1", "afebrile"). Report how many notes in each specialty contain at least one temperature mention.
+
+Regex builders like [this website](https://spannbaueradam.shinyapps.io/r_regex_tester/) can make it a lot quicker to iterate and improve your regular expressions!
+
+```{r q2}
+# Your code here
+# Temperature regex
+temp_pattern <- "(\\d+\\.?\\d*)\\s*(°?\\s*[FC]|degrees?\\s*[FC]?)|(temperature\\s+of\\s+\\d+\\.?\\d*)|(afebrile)"
+
+filtered_data |>
+  mutate(has_temp = str_detect(transcription, regex(temp_pattern, ignore_case = TRUE))) |>
+  count(medical_specialty, has_temp) |>
+  filter(has_temp) |>
+  select(medical_specialty, notes_with_temp = n)
+
+```
+
+------------------------------------------------------------------------
+
+## Text Normalisation
+
+A key stage in traditional text analysis is to normalise raw text — reducing variability due to capitalisation, punctuation, and common function words — before any modelling or analysis.
+
+### Tokenisation and stop word removal
+
+`tidytext::unnest_tokens()` splits text into individual tokens and lowercases everything. We then strip residual punctuation, drop very short tokens, and remove stop words (common words like "the", "of", "and" that carry little domain information):
+
+```{r tokenise}
+tokenised_data <- filtered_data |>
+  unnest_tokens(word, transcription, to_lower = TRUE) |>
+  mutate(word = str_replace_all(word, "[^[:alpha:]]", "")) |>
+  filter(str_length(word) > 1) |>
+  anti_join(stop_words, by = "word")
+
+glimpse(tokenised_data)
+```
+
+**Q3 (2 marks):** How many stop words are in the `stop_words` list, how many different `lexicon` are included, and which `lexicon` contains the most stop words? Answer these questions using code below and create a bargraph of the number of unique stop words per lexicon.
+
+```{r stop-word-lexicons}
+
+# Total stop words and lexicons
+cat("Total stop words:", nrow(stop_words), "\n")
+cat("Distinct lexicons:", n_distinct(stop_words$lexicon), "\n\n")
+
+cat("Rows per lexicon (count):\n")
+   stop_words |> count(lexicon, sort = TRUE) |> print()
+
+```
+
+```{r}
+# Bar graph of unique stop words per lexicon
+stop_words |>
+  group_by(lexicon) |>
+  summarise(n_unique = n_distinct(word), .groups = "drop") |>
+  ggplot(aes(reorder(lexicon, n_unique), n_unique, fill = lexicon)) +
+  geom_col(show.legend = FALSE) +
+  labs(title = "Unique stop words per lexicon",
+       x = "Lexicon", y = "Count")
+```
+
+**Q4 (2 marks):** How many *unique* unigrams (distinct words) are there in total across all the cleaned and tokenised transcriptions for each specialty? Which specialty has the largest vocabulary and which the smallest? Complete the code below, then provide a 1-2 sentence interpretation of the output.
+
+```{r q4}
+## Uncomment and complete this pipeline-fill in the blank inside n_distinct()
+tokenised_data |>
+  group_by(medical_specialty) |>
+  summarise(unique_words = n_distinct(word))
+
+## Now calculate the mean number of unique unigrams per NOTE for each specialty
+  tokenised_data |>
+    group_by(medical_specialty, note_id) |>
+    summarise(unique_words = n_distinct(word), .groups = "drop") |>
+    group_by(medical_specialty) |>
+    summarise(mean_unique_words = mean(unique_words))
+```
+
+### Bigrams
+
+We can also combined consecutive words into two-word phrases (bigrams) which better capture medical compound terms that unigrams split apart (e.g., "blood pressure", "right knee", "general anaesthesia"):
+
+```{r bigrams}
+bigrams <- filtered_data |>
+  unnest_tokens(bigram, transcription, token = "ngrams",
+                n = 2, to_lower = TRUE) |>
+  filter(!is.na(bigram)) |>
+  mutate(word1 = word(bigram, 1),
+         word2 = word(bigram, 2)) |>
+  filter(!word1 %in% stop_words$word,
+         !word2 %in% stop_words$word,
+         !str_detect(word1, "\\d"),
+         !str_detect(word2, "\\d")) |>
+  select(-word1, -word2)
+
+bigrams |>
+  count(medical_specialty, bigram, sort = TRUE) |>
+  slice_max(n, n = 6, by = medical_specialty, with_ties = FALSE) |>
+  arrange(medical_specialty)
+```
+
+**Q5 (1 mark):** What is the most common bigram in each specialty?
+
+```{r bigram_totals}
+bigrams |>
+  count(medical_specialty, bigram, sort = TRUE) |>
+  slice_max(n, n = 1, by = medical_specialty, with_ties = FALSE)
+```
+
+### Sentence segmentation
+
+Another common text processing step is to split our text into distinct sentences. Again our old friend `unnest_tokens` can do a lot of the heavy lifting!
+
+```{r sentences}
+sentences_data <- filtered_data |>
+  unnest_tokens(sentence, transcription,
+                token = "sentences", to_lower = FALSE)
+
+sentences_data |>
+  group_by(medical_specialty) |>
+  summarise(total_sentences  = n(),
+            n_notes          = n_distinct(note_id),
+            mean_per_note    = round(total_sentences / n_notes, 1))
+```
+
+**Q6 (1 mark):** How many *unique* sentences are there in each specialty? Uncomment and complete the code below (replace each `___` with the correct column name):
+
+```{r q6}
+sentences_data |>
+  group_by(medical_specialty) |>
+  summarise(unique_sentences = n_distinct(sentence))
+```
+
+## Stemming and Lemmatization
+
+However, given how noisy language is and the many variants of the same word (alternative suffixes) like pluralisation or possessive apostrophes. We also often want to "normalise" words to a common base form. There are two main approaches to this:
+
+- **Stemming**-crude suffix stripping, fast but imprecise: "operating" to "operat" (`SnowballC::wordStem`)
+
+- **Lemmatization**-linguistically informed root form: "operating" to "operate" (`textstem::lemmatize_words`)
+
+  We can apply these normalisations using the associated library functions.
+
+```{r stem-vs-lemma}
+word_sample <- tokenised_data |>
+  distinct(word) |>
+  mutate(stem  = SnowballC::wordStem(word, language = "english"),
+         lemma = textstem::lemmatize_words(word))
+
+word_sample |>
+  filter(word != stem | word != lemma) |>
+  select(word, stem, lemma) |>
+  slice_head(n = 15)
+```
+
+**Q7 (1 mark):** Does lemmatising or stemming result in fewer unique words?
+
+```{r stemming_v_lemmatising}
+tibble(
+  approach = c("stemming", "lemmatization"),
+  n_unique = c(
+    n_distinct(SnowballC::wordStem(tokenised_data$word, language = "english")),
+    n_distinct(textstem::lemmatize_words(tokenised_data$word))
+  )
+)
+```
+
+**Q8 (2 marks):** In 2-3 sentences explain why a general-purpose English lemmatizer is likely to perform poorly on medical transcription text. Give at least two examples of medical terms that would likely be handled incorrectly and describe what goes wrong.
+
+A general-purpose English lemmatizer is built from everyday vocabulary and morphology, so it mishandles the Greco-Latin inflections and domain specific jargon that dominate clinical notes. For example, *metastases* should reduce to *metastasis* and *vertebrae* to *vertebra*, but a standard lemmatizer typically leaves these irregular Latin plurals untouched, so singular and plural forms are never merged. It also has no model of clinical abbreviations and units tokens such as *mg* or *Ca* (calcium vs. cancer) are treated as ordinary words, losing or confusing their meaning so the normalization is inconsistent: it fails to merge true variants while occasionally conflating unrelated terms.
+
+### Applying lemmatisation to the full dataset
+
+Now let's lemmatise the full dataset:
+
+```{r lemmatize, cache=TRUE}
+unique_lemmas <- tokenised_data |>
+  distinct(word) |>
+  mutate(lemma = textstem::lemmatize_words(word))
+
+lemmatised_data <- tokenised_data |>
+  left_join(unique_lemmas, by = "word")
+```
+
+We can now look more easily at the most frequent (lemmatised) words per specialty
+
+```{r top-lemmas-plot}
+lemmatised_data |>
+  count(medical_specialty, lemma, sort = TRUE) |>
+  slice_max(n, n = 8, by = medical_specialty, with_ties = FALSE) |>
+  ggplot(aes(n, reorder_within(lemma, n, medical_specialty),
+             fill = medical_specialty)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~medical_specialty, scales = "free_y") +
+  scale_y_reordered() +
+  labs(title = "Most frequent lemmas per specialty",
+       x = "Count", y = NULL)
+```
+
+## TF-IDF: Finding Discriminating Terms
+
+Unfortunately, as you can see above, raw counts are dominated by generic medical words ("patient", "history", "left"). TF-IDF (term frequency–inverse document frequency) down-weights terms common across all documents and up-weights terms characteristic of a specific category. Sun et al. (2024) used word-frequency analysis as a first step before LDA to explore the vocabulary of their social work notes.
+
+```{r tfidf}
+specialty_tfidf <- lemmatised_data |>
+  count(medical_specialty, lemma) |>
+  bind_tf_idf(lemma, medical_specialty, n)
+
+specialty_tfidf |>
+  group_by(medical_specialty) |>
+  slice_max(tf_idf, n = 25, with_ties = FALSE) |>
+  ggplot(aes(tf_idf,
+             reorder_within(lemma, tf_idf, medical_specialty),
+             fill = medical_specialty)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~medical_specialty, scales = "free") +
+  scale_y_reordered() +
+  labs(title = "Top 25 lemmas by TF-IDF per specialty",
+       x = "TF-IDF", y = NULL)
+```
+
+**Q9 (2 marks):** Do the top TF-IDF terms make clinical sense for each specialty? Identify one term that surprises you from any specialty. Complete the code below by replacing `"your_term_here"` with that term to pull an example transcription containing it, then briefly explain its clinical context.
+
+```{r q9}
+filtered_data |>
+  filter(str_detect(transcription, "ligament")) |>
+  slice(1) |>
+  pull(transcription) |>
+  str_trunc(600)
+```
+
+Surprising term: ligament — it's the #1 TF-IDF term for both Radiology and Orthopedic. It's surprising because you wouldn't expect an "imaging" specialty's single most-discriminating word to be the same as an Orthopedic-sounding anatomical structure.
+
+Clinical context: It makes sense once you consider that a large share of diagnostic imaging (especially MRI) is musculoskeletal imaging used to assess ligament tears and injuries — e.g., the example transcript pulled by the code chunk is a Radiology note for a foot/ankle procedure. So Radiology and Orthopedic share substantial vocabulary overlap around joint and soft-tissue pathology,
+
+### Comparing lemma proportions across specialties
+
+Now let's compare across specialties. This plot shows each lemma's proportion in Orthopedic notes (y-axis) against its proportion in Radiology or Neurology (x-axis, one facet each). Terms near the dashed diagonal are used similarly in both specialties; terms far from it are specialty-specific.
+
+```{r proportion-plot}
+specialty_props <- lemmatised_data |>
+  count(medical_specialty, lemma) |>
+  group_by(medical_specialty) |>
+  mutate(proportion = n / sum(n)) |>
+  ungroup() |>
+  pivot_wider(id_cols     = lemma,
+              names_from  = medical_specialty,
+              values_from = proportion,
+              values_fill = 0) |>
+  pivot_longer(c(Radiology, Neurology),
+               names_to  = "comparison_specialty",
+               values_to = "proportion")
+
+ggplot(specialty_props |> filter(proportion > 0, Orthopedic > 0),
+       aes(x = proportion, y = Orthopedic,
+           colour = abs(Orthopedic - proportion))) +
+  geom_abline(colour = "grey40", linetype = 2) +
+  geom_jitter(alpha = 0.1, size = 1.8, width = 0.0003, height = 0.0003) +
+  geom_text(aes(label = lemma), check_overlap = TRUE,
+            vjust = 1.5, size = 2.5) +
+  scale_x_log10(labels = percent_format(accuracy = 0.001)) +
+  scale_y_log10(labels = percent_format(accuracy = 0.001)) +
+  scale_colour_gradient(limits = c(0, 0.003),
+                        low = "darkslategray4", high = "gray75") +
+  facet_wrap(~comparison_specialty) +
+  theme(legend.position = "none") +
+  labs(y = "Orthopedic", x = "Comparison specialty",
+       title = "Lemma proportions: Orthopedic vs. Radiology and Neurology")
+```
+
+**Q10 (2 marks):** What does this plot tell you about the lexical similarity between Orthopedic and Neurology compared with Orthopedic and Radiology? Is this what you would expect given the clinical roles of each specialty? Justify your answer in 2-4 sentences.
+
+The plot shows more lemmas hugging the diagonal in the Orthopedic vs Radiology facet than in the Orthopedic vs Neurology facet, indicating that Orthopedic and Radiology share more vocabulary. This is what I would expect clinically: orthopedic care relies heavily on imaging, so both specialties use overlapping anatomical and imaging language (e.g., *joint*, *fracture*, *lateral*, *view*). Neurology, by contrast, skews toward its own terms (*seizure*, *headache*, *nerve*, *weakness*), so fewer terms fall on the Orthopedic vs Neurology diagonal. The closer ortho-radiology relationship reflects their direct clinical workflow, where orthopedic findings are routinely confirmed and described through radiologic studies.
+
+------------------------------------------------------------------------
+
+## Topic Modelling with Latent Dirichlet Allocation
+
+Latent Dirichlet Allocation (LDA) is an unsupervised probabilistic model that treats each document as a mixture of topics and each topic as a probability distribution over words. Unlike supervised classifiers, LDA discovers thematic structure from the text alone-no specialty labels are used during training. This mirrors the approach of Sun et al. (2024), who applied LDA to clinical social work notes to uncover latent SDoH themes without predefined categories.
+
+Two key outputs of a fitted LDA model:
+
+| Output | Symbol | Interpretation |
+|----|----|----|
+| Word–topic matrix | β (beta) | Probability that word *w* is generated by topic *k* |
+| Document–topic matrix | γ (gamma) | Proportion of document i.e., transcript *d* attributed to topic *k* |
+
+### Building the document-term matrix
+
+We aggregate lemma counts per note and apply two filters before building the DTM:
+
+1.  Minimum document frequency - drop terms appearing in fewer than 5 notes to reduce sparsity.
+2.  TF-IDF filtering - drop terms whose mean TF-IDF (computed per note) falls in the bottom quartile. Words that are common across nearly all notes have low IDF and therefore low TF-IDF; retaining them would give LDA noisy, non-discriminative signal.
+
+```{r dtm-build, cache=TRUE}
+term_counts <- lemmatised_data |>
+  count(note_id, lemma)
+
+# Keep only terms present in >= 5 notes
+doc_freq_filter <- term_counts |>
+  distinct(note_id, lemma) |>
+  count(lemma, name = "doc_count") |>
+  filter(doc_count >= 5)
+
+# Keep only terms whose mean per-note TF-IDF is above the 25th percentile
+tfidf_filter <- term_counts |>
+  bind_tf_idf(lemma, note_id, n) |>
+  group_by(lemma) |>
+  summarise(mean_tfidf = mean(tf_idf), .groups = "drop") |>
+  filter(mean_tfidf > quantile(mean_tfidf, 0.25))
+
+emr_dtm <- term_counts |>
+  semi_join(doc_freq_filter, by = "lemma") |>
+  semi_join(tfidf_filter,    by = "lemma") |>
+  cast_dtm(note_id, lemma, n)
+
+emr_dtm <- emr_dtm[rowSums(as.matrix(emr_dtm)) > 0, ]
+
+cat("DTM:", nrow(emr_dtm), "documents ×", ncol(emr_dtm), "terms\n")
+```
+
+### Fitting the LDA model
+
+We fit LDA with `k = 3` topics-one per specialty-so we can directly compare the discovered topics against the known specialty labels. Again this would likely be something you explore or optimise using more sophisticated hierarchical models.
+
+```{r fit-lda, cache=TRUE}
+set.seed(42)
+k_topics <- 3
+emr_lda  <- topicmodels::LDA(emr_dtm, k = k_topics,
+                              control = list(seed = 42))
+```
+
+### Word–topic probabilities (β)
+
+The β matrix tells us which words are most characteristic of each topic:
+
+```{r lda-beta-plot}
+lda_beta <- tidy(emr_lda, matrix = "beta")
+
+lda_beta |>
+  group_by(topic) |>
+  slice_max(beta, n = 12, with_ties = FALSE) |>
+  ggplot(aes(beta,
+             reorder_within(term, beta, topic),
+             fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~topic, scales = "free_y",
+             labeller = labeller(topic = function(x) paste("Topic", x))) +
+  scale_y_reordered() +
+  labs(title = "Top 12 words per LDA topic (β probabilities)",
+       x = "β  (word–topic probability)", y = NULL)
+```
+
+**Q11 (2 marks):** Based on the top words in the β plot, give each topic a brief descriptive clinical label (e.g., "imaging", "musculoskeletal", "neurological"). Which topic do you think corresponds most closely to which specialty, and why? Does the vocabulary in each topic match your expectations from the TF-IDF results in Section 6?
+
+Topic to specialty mapping: Topic 3 maps most clearly to Orthopedic — the joint/tendon/fracture vocabulary is directly orthopedic. Topic 1 maps to both Neurology and Radiology — brain/vascular imaging terms are shared across both, since neuro imaging studies are read and reported by Radiology. Topic 2 (spinal) doesn't dominate any single specialty , reflecting that spine pathology is addressed by all three: imaged by Radiology, operated on by Orthopedic, and neurologically relevant via cord/root involvement.
+
+Match with TF-IDF (Section 6): Only partially. Topic 3's vocabulary (ligament, tendon, knee, fracture) closely mirrors the Orthopedic/Radiology TF-IDF overlap from Q9, where "ligament" topped both lists. But Topic 1's vocabulary (brain, carotid, tumor) doesn't resemble the actual top TF-IDF terms for Neurology (temporal, memory, epilepsy, diplopia) or Radiology (mci, myoview, dobutamine, fetal) — TF-IDF down-weights terms common across specialties, whereas LDA surfaces exactly those shared cross-specialty themes.
+
+### Document–topic distributions (γ) by specialty
+
+The γ matrix tells us how much each document (i.e., transcript in this case) draws from each topic. We join it with specialty labels to see whether LDA-discovered topics align with the known clinical categories:
+
+```{r lda-gamma}
+lda_gamma <- tidy(emr_lda, matrix = "gamma")
+
+lda_gamma_specialty <- lda_gamma |>
+  left_join(
+    filtered_data |>
+      mutate(document = as.character(note_id)) |>
+      select(document, medical_specialty),
+    by = "document"
+  )
+```
+
+```{r lda-gamma-plot}
+lda_gamma_specialty |>
+  group_by(medical_specialty, topic) |>
+  summarise(mean_gamma = mean(gamma), .groups = "drop") |>
+  mutate(topic = factor(topic, labels = paste("Topic", seq_len(k_topics)))) |>
+  ggplot(aes(topic, mean_gamma, fill = medical_specialty)) +
+  geom_col(position = "dodge") +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(title = "Mean topic proportion by specialty (γ)",
+       x = NULL, y = "Mean γ", fill = "Specialty")
+```
+
+**Q12 (3 marks):**
+
+(a) Based on the γ plot, which specialty has the clearest dominant topic (i.e., one topic has a noticeably higher mean γ than the others for that specialty)? Does this align with the clinical label you assigned to that topic in Q11?
+
+    Neurology has the clearest dominant topic. Topic 1's mean γ ≈ 0.81 for Neurology, compared to only ≈0.16 and ≈0.04 for Topics 2 and 3 — a gap of \~0.65, larger than for either Orthopedic (gap \~0.32) or Radiology (gap \~0.55).
+
+    This aligns with the Q11 label for Topic 1 ("neurological/vascular imaging" — brain, artery, carotid, tumor, lesion, mass, ct), which fits a neurological theme. Though note Radiology's γ for Topic 1 (≈0.73) is almost as high, so this topic is shared between the two specialties rather than unique to Neurology alone.
+
+(b) Uncomment and complete the code below to compute, for each specialty, the single topic with the highest mean γ. Replace each `___` with the correct column name or expression.
+
+```{r q12b}
+lda_gamma_specialty |>
+  group_by(medical_specialty, topic) |>
+  summarise(mean_gamma = mean(gamma), .groups = "drop") |>
+  group_by(medical_specialty) |>
+  slice_max(mean_gamma, n = 1)
+```
+
+(c) Sun et al. (2024) ran LDA on social work notes *without knowing in advance* what topics would emerge. How does their situation differ from this exercise, where we set `k = 3` to match three known specialties? What does this suggest about how to choose the number of topics *k* in a real exploratory analysis?
+
+    Sun et al. (2024) had no ground truth. They ran LDA without knowing in advance what topics would emerge, so k was a genuinely open modelling choice requiring data-driven selection (fitting multiple candidate k values, comparing fit metrics like perplexity/coherence, and validating interpretability with domain experts).
+
+    Implication: in a real exploratory analysis, k shouldn't be chosen based on the number of expected/known categorie. The natural number of latent themes in text may not align with any predefined grouping, and even a "correct" k doesn't guarantee a clean 1:1 topic-to-category mapping. Instead, k should be selected empirically: fit a range of values, narrow using quantitative fit/coherence metrics, then rely on domain-expert review of topic interpretability — iterating rather than assuming a single correct k upfront.
+
+------------------------------------------------------------------------
+
+## LLMs for Clinical Text Analysis
+
+Finally, let's address the LLM in the room. Chung et al. (2024) showed that GPT-4 Turbo, with no task-specific training, could classify perioperative outcomes from pre-operative notes using carefully designed prompts (zero-shot, few-shot, chain-of-thought).
+
+Let's experiment similarly to classify a single note and then compare its reasoning with the LDA topic model's assignment. You can use whichever LLM you are comfortable using (Dalhousie students have access to Microsoft Copilot via Office 365 (copilot.microsoft.com) with some degree of data protection/agreements).
+
+### Sample note
+
+```{r sample-note, cache=FALSE}
+# Sample from notes that appear in the topic model
+set.seed(42)
+dtm_note_ids <- as.integer(rownames(emr_dtm))
+
+q10_note <- filtered_data |>
+  filter(note_id %in% dtm_note_ids) |>
+  slice_sample(n = 1)
+
+cat("=== True specialty:", q10_note$medical_specialty, "===\n\n")
+cat("Description:", q10_note$description, "\n\n")
+cat("--- Transcription (first 1200 characters) ---\n")
+cat(str_trunc(q10_note$transcription, 1200))
+```
+
+LDA topic assignment for this note (γ values, highest first):
+
+```{r sample-note-gamma, cache=FALSE}
+lda_gamma_specialty |>
+  filter(document == as.character(q10_note$note_id)) |>
+  mutate(topic = paste("Topic", topic)) |>
+  arrange(desc(gamma))
+```
+
+**Q13 (3 marks):** Copy the transcription above into Microsoft Copilot and use the following prompt:
+
+> *"I will give you a medical transcription. Classify it as exactly one of: Orthopedic, Radiology, or Neurology. Think step by step and explain your reasoning before giving your final answer. Transcription: [paste text here]"*
+
+(a) What specialty did the LLM predict, and was it correct? Does it match the topic with the highest γ from the LDA model above?
+
+    Copilot predicted Orthopedic, which is correct — the note's true medical_specialty is Orthopedic.
+
+(b) What specific features of the text did the LLM cite to justify its classification?
+
+    Diagnosed conditions — hallux abductovalgus (bunion), hammer toes, tailor’s bunionette, degenerative joint disease of the first metatarsophalangeal joint, rheumatoid arthritis, and a contracted MTP joint — all described as musculoskeletal issues.
+
+    Procedures performed — bunionectomy, arthrodesis of the toes, hammertoe repair, extensor tenotomy and capsulotomy, and a modified tailor’s bunionectomy — described as orthopedic surgeries involving the bones, joints, and tendons of the foot.
+
+    Elimination of alternatives — Copilot noted that there was no focus on imaging (Radiology) and no primary involvement of the nervous system (Neurology).
+
+(c) Compare LLM's explanation-based classification with LDA's unsupervised topic assignment. Which approach would you prefer for classifying a large batch of new clinical notes, and why?
+
+    LLM (Copilot) produces a single, human-readable, explained classification — citing specific diagnoses, procedures, and reasoning by elimination. It requires predefined category labels up front (zero-shot), and each note requires a separate prompt/API call — slow and costly at scale, and means sending potentially sensitive clinical text to an external service.
+
+    I'd prefer LDA (or a classifier trained on its output) for bulk classification — it's cheaper, faster, reproducible, and keeps clinical text in-house rather than sent to an external LLM. I'd reserve the LLM approach for auditing/spot-checking a sample of LDA's assignments and for resolving ambiguous cases — e.g., notes whose γ is split across multiple topics, where Copilot's explanation-based reasoning can disambiguate in a way LDA's raw probabilities cannot.
+
+------------------------------------------------------------------------
+
+## Tying back to the literature
+
+**Q14 (1 mark):** Sun et al. (2024) applied LDA topic modelling to clinical social work notes to explore SDoH factors. Name two of the SDoH-related topics they identified and state the name of the metric they used to evaluate topic quality (hint: it measures the coherence of the top words within a topic).
+
+Sun et al. (2024) identified SDoH-related topics such as financial status/income and social support (other acceptable examples include abuse history, mental health, and living conditions).
+
+The metric they used to evaluate topic quality was topic coherence.
+
+**Q15 (1 mark):** Chung et al. (2024) tested GPT-4 Turbo on both classification and numerical prediction tasks. Name one task where the LLM performed well (give the F1 score) and one where it failed to beat a simple baseline (give the MAE and the baseline value for comparison).
+
+Chung et al. (2024) found that GPT-4 Turbo performed well on some classification tasks. One example was hospital mortality prediction, where it achieved an F1 score of 0.86. Another strong result was ICU admission prediction with an F1 score of 0.81.
+
+However, the LLM failed to outperform a simple baseline on numerical prediction tasks. For example, for hospital duration prediction, GPT-4 Turbo achieved a mean absolute error (MAE) of 4.5 days, while the simple dummy baseline predictor had an MAE of 5.4 days for comparison. The paper notes that numerical prediction performance was generally poor.
+
+------------------------------------------------------------------------
+
+## Reproducibility
+
+```{r session-info, cache=FALSE}
+sessioninfo::session_info()
+```
+
+------------------------------------------------------------------------
+
+*Dataset: MTSamples via `clinspacy` (mtsamples.com) with material drawn from Silge & Robinson,* Text Mining with R *(tidytextmining.com)*
