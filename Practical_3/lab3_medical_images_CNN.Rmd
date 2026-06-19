@@ -1,0 +1,592 @@
+---
+title: "Practical 3 - Medical Imaging: Detecting Diabetic Retinopathy with CNNs"
+author: "Vivekkumar Dudhat"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    df_print: paged
+    theme: cosmo
+    highlight: tango
+    number_sections: false
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  message    = FALSE,
+  warning    = FALSE,
+  fig.align  = "center",
+  fig.width  = 7,
+  fig.height = 4.5,
+  dpi        = 110,
+  cache      = TRUE,
+  cache.lazy = FALSE
+)
+
+GLOBAL_SEED <- 42
+set.seed(GLOBAL_SEED)
+```
+
+> **Submission.** Knit your Rmd file into HTML and submit it via Brightspace. Include a link to your git repository (GitHub or git.cs.dal.ca) as a comment on your submission.
+
+------------------------------------------------------------------------
+
+## 0 Setup
+
+Unlike the tabular and text modules, deep learning on images leans on libraries written in C++/CUDA. These can be a bit challenging to install and use via R but the [`mlverse`](https://mlverse.org/) stack is a modern and supposedly **self-contained and cross-platform** set of R bindings for some of the main deep learning/image libraries:
+
+- `torch` is one of the main current neural network library (the other being `tensorflow`) and provides lots of functions for defining neural-network layers and converting them to efficient code for training and running on GPUs/CPUs. The R library is really just a set of R functions which let you run underlying C++/CUDA from within R (these are known as `bindings`). When you install `torch` in R, it downloads its own copy of LibTorch on first use.
+- `torchvision` is a set of efficient helper functions for handling images in neural networks (e.g., image transforms, dataset helpers, and access to *pre-trained* networks).
+- `magick` is a tool for viewing and manipulating images which works on Mac, Windows, or Linux. These tasks can be surprisingly operating system specific usually.
+
+Copy the following into the console to install dependencies (make sure it finishes correctly):
+
+```         
+install.packages(c(
+  "torch", "torchvision", "luz",   # deep learning stack
+  "tidyverse", "here", "fs",       # data wrangling + reproducible paths
+  "magick", "gridExtra",           # image display
+  "yardstick"                      # evaluation metrics (also used in Lab 1)
+))
+```
+
+Then copy the following into the console to finish the `torch` install (it will take a few minutes to complete):
+
+```         
+install_torch()
+```
+
+If that all worked, the following should run without an error as a normal code-block:
+
+```{r packages}
+library(torch)        # tensors, autograd, neural-network layers
+library(torchvision)  # image transforms, datasets, pretrained models
+library(luz)          # high-level training loop (fit/predict/metrics)
+library(tidyverse)    # dplyr, ggplot2, readr, purrr, ...
+library(here)         # reproducible file paths
+library(fs)           # filesystem helpers
+library(magick)       # image display only
+library(gridExtra)    # arranging plots in a grid
+library(yardstick)    # ROC-AUC, sensitivity, specificity, confusion matrix
+
+torch_manual_seed(GLOBAL_SEED)
+set.seed(GLOBAL_SEED)
+```
+
+## 1 Introduction
+
+Medical imaging is one of the most data-rich corners of medicine with a single trip to the emergency room able to generate hundreds of gigabytes across X-ray, CT, MRI, PET and ultrasound. As covered in the lecture, the *shape* of that data ranges from a single number (e.g., optical density) up to 4D tensors (a PET-CT time-series), and the *questions* we ask ranges from preprocessing and segmentation through to detection, classification and outcome **prediction**.
+
+This practical focuses on **2D colour fundus photographs (CFPs)** of the retina and the task of detecting **diabetic retinopathy (DR)** i.e., damage to the retinal blood vessels caused by diabetes. This is one of the leading global causes of preventable blindness. Manual screening is done accurately by ophthalmologists but does not easily scale (especially across resource-limited settings) to the \~500 million people living with diabetes. Predictive models may help fill this scaling gap.
+
+We will very loosely mirror the analyses in the two assigned papers and refer back to them in the questions:
+
+- **Gulshan et al. (2016, *JAMA*)** trained an Inception-v3 CNN (with ImageNet transfer learning) to **detect** *referable* DR, reaching an AUC of \~0.99 and reporting two clinical operating points (one tuned for high sensitivity, one for high specificity).
+- **Arcadu et al. (2019, *npj Digital Medicine*)** went further and tried to **predict future** DR progression from a single visit, using field-specific Inception-v3 networks aggregated by a random forest, and interpreted them with attribution maps and SHAP.
+
+**Learning objectives:** by the end of this practical you should be able to:
+
+- Load, inspect and normalise medical image data as `torch` tensors
+- Build, train and evaluate a convolutional neural network (CNN) from scratch with `luz`
+- Apply data augmentation and explain its role as a prior on image variability
+- Use **transfer learning** to apply an ImageNet-pretrained network to the problem
+- Evaluate a clinical classifier with ROC-AUC, sensitivity/specificity and **operating points**
+- Connect model performance to the real-world hurdles of clinical deployment
+
+## 2 The Data
+
+### 2.1 Download and cache
+
+We use a curated subset of fundus photographs graded for DR severity on the 5-point International Clinical Diabetic Retinopathy (ICDR) scale (the clinical cousin of the ETDRS scale used by Arcadu et al.):
+
+| Grade | Severity                      |
+|-------|-------------------------------|
+| 0     | No DR                         |
+| 1     | Mild non-proliferative DR     |
+| 2     | Moderate non-proliferative DR |
+| 3     | Severe non-proliferative DR   |
+| 4     | Proliferative DR              |
+
+As in Lab 1, we download a prepared archive once and cache it locally so the chunk only re-runs if the file is missing.
+
+```{r data-paths}
+data_dir  <- here()
+cache_dir <- fs::path(data_dir, "cache")
+fs::dir_create(cache_dir)
+
+data_url <- "https://maguire-lab.github.io/health_data_science_research_2026/static_files/practicals/dr_fundus.zip"
+zip_path <- fs::path(cache_dir, "dr_fundus.zip")
+img_root <- fs::path(data_dir, "dr_fundus")
+```
+
+```{r download-data, cache = TRUE}
+if (!fs::dir_exists(img_root)) {
+  if (!fs::file_exists(zip_path)) {
+    download.file(data_url, zip_path, mode = "wb", quiet = TRUE)
+  }
+  unzip(zip_path, exdir = data_dir)
+}
+
+# The archive contains:
+#   dr_fundus/images/<id>.jpg   -- the fundus photographs
+#   dr_fundus/labels.csv        -- columns: image, split, grade
+fs::dir_ls(img_root)
+```
+
+### 2.2 Load the labels
+
+```{r load-labels}
+labels <- read_csv(fs::path(img_root, "labels.csv")) |>
+  mutate(
+    path  = fs::path(img_root, "images", image),
+    grade = as.integer(grade)
+  ) |>
+  # Simplify to the two extremes of the ICDR scale: grade 0 vs grade 4
+  filter(grade %in% c(0L, 4L)) |>
+  mutate(
+    grade     = factor(grade, levels = c(0, 4)),
+    # binary target: 1 = severe (grade 4, certainly referable), 0 = healthy (grade 0)
+    referable = as.integer(grade == 4)
+  )
+
+glimpse(labels)
+```
+
+To keep this teaching example clean and the dataset as small as possible, we frame the task as the **easiest possible** version of the clinical problem: telling the two *extremes* apart - a **clearly-healthy** eye (grade 0, no DR) versus the **most severe** (grade 4, proliferative DR). We will NOT use cross-validation this time and instead use a separate validation and test dataset. This reduces the number of times we have to train these models.
+
+**Q1 (2 marks):** In your own words, what is diabetic retinopathy, and what is the clinical benefit of being able to flag *referable* DR automatically from a photograph? Why might a screening tool prefer to err towards over-referral? *(Hint: see the opening paragraphs of Gulshan et al.)*
+
+**Answer Q1: Diabetic retinopathy (DR)** is a complication of diabetes in which high blood sugar damages the small blood vessels in the retina. These damaged vessels can leak fluid, bleed, or grow abnormally, eventually causing vision impairment or blindness if not detected and treated. Automated detection of **referable diabetic retinopathy** from retinal photographs is clinically valuable because it can increase the efficiency, consistency, and coverage of screening programs while reducing barriers to access. Since millions of people with diabetes require regular eye screening, an automated system can help identify patients who need specialist evaluation much more quickly than relying solely on ophthalmologists. Screening tools generally prefer to **err toward over-referral** because missing a true case of referable DR (a false negative) could delay treatment and lead to preventable vision loss. In contrast, a false positive usually results only in an additional eye examination. Therefore, screening systems are often designed with **high sensitivity**, accepting some extra referrals in order to minimize the risk of overlooking patients who need care.
+
+**Q2 (2 marks):** Based on `glimpse()` and the data dictionary above, what information about how these images were captured is **missing** that could matter for an analysis? Give two examples and say why each matters.
+
+**Answer Q2:** **The camera model or imaging device used to capture each image is not reported.** This matters because different cameras can produce images with different resolutions, color balances, and image quality, which may affect how well a trained model generalizes to new data.
+
+**The dataset does not indicate whether pupil dilation was used before imaging.** This matters because pupil dilation can improve visibility of retinal structures and reduce image artifacts, potentially affecting both image quality and disease detection performance.
+
+### 2.3 Class balance
+
+```{r class-balance, fig.height = 3}
+labels |>
+  mutate(label = if_else(referable == 1, "Severe DR", "Healthy")) |>
+  count(split, label) |>
+  ggplot(aes(label, n, fill = label)) +
+  geom_col() +
+  facet_wrap(~split) +
+  scale_fill_manual(values = c("Healthy" = "grey60",
+                               "Severe DR"  = "firebrick")) +
+  labs(x = NULL, y = "Number of Images",
+       title = "Healthy vs Severe DR Balance per Split") +
+  theme(legend.position = "none")
+```
+
+**Q3 (1 marks):** What sort of ML issues may arise with a dataset that has this sort of label/class balance?
+
+**Answer Q3:** The dataset has roughly a 2.7:1 imbalance across all splits (e.g., 134 healthy vs 49 severe DR in training). The main ML issue this causes is that a model could predict "healthy" for every single image and still achieve around 73% accuracy without learning anything useful, making accuracy a misleading metric. Beyond that, during training the loss is dominated by the majority class, so the model gets pushed to favour predicting healthy by default and may rarely flag severe DR — which is exactly the cases that matter most clinically.
+
+### 2.4 Look at the images
+
+It is *always* worth looking directly at the raw data before modelling. Each time you re-run this block you will get a different random sample of images.
+
+```{r show-images, fig.width = 8, fig.height = 4.5}
+samples <- labels |>
+  filter(split == "train") |>
+  slice_sample(n = 6)
+
+plots <- map2(samples$path, samples$grade, \(p, g) {
+  magick::image_ggplot(magick::image_read(p)) +
+    ggtitle(paste("Grade", g)) +
+    theme(plot.title = element_text(size = 9))
+})
+
+gridExtra::grid.arrange(grobs = plots, nrow = 2, ncol = 3)
+```
+
+**Q4 (3 marks):** Looking at these images, identify **two** properties that vary between photographs of the same class that we may want to normalise/process before training? Can you see any consistent differences between Grade 4 and Grade 0 photographs? (Rerun the code-block a few times to get different images).
+
+**Answer Q4:** After viewing multiple samples across both grades, two properties that vary within the same class are:
+
+1.  **Brightness and colour tone** — even within grade 0, images vary noticeably. Some images (e.g., a_IDRiD_139, a_IDRiD_141) are much brighter and more saturated orange, while others (e.g., a_IDRiD_138, a_IDRiD_140) are darker. The same variation appears in grade 4. If not normalised, the model could learn to associate brightness with a class rather than actual disease features. This is addressed by the `transform_normalize` step using ImageNet mean and standard deviation.
+
+2.  **Optic disc position** — the bright circular optic disc appears on different sides of the image depending on whether the photograph is of a left or right eye. For example, a_IDRiD_138 and a_IDRiD_140 have the disc on the right, while a_IDRiD_139 and a_IDRiD_141 have it on the left. This lateral variation means the same anatomical structure appears in different spatial locations across images.
+
+Yes, there are consistent differences between Grade 4 and Grade 0. Grade 4 images consistently show visible damage — large dark red haemorrhages (e.g., a_IDRiD_005), yellow/golden exudates concentrated around the macula (e.g., a_IDRiD_008), and white fibrous neovascular tissue (e.g., a_IDRiD_007) which is characteristic of proliferative DR. Grade 0 images are consistently clean with regular well-defined vessel branching and no lesions. The difference is striking even to a non-clinician.
+
+------------------------------------------------------------------------
+
+## 3 Pre-processing
+
+### 3.1 From image file to tensor
+
+A colour image is a **3D tensor** of shape `channels × height × width`. `torch` expects a 4D batch of shape `images × channels × height × width`. We build a small, *lazy* pipeline that reads each file only when needed (so we never hold the whole dataset in memory at once - although this specific dataset is small enough to do that on most computers) and:
+
+1.  Loads the JPEG into a `[0, 1]` tensor,
+2.  Resizes it to 224 × 224 (most neural networks require a single consistent input size),
+3.  Normalises each channel using the mean colour intensity and standard deviation across the entire **ImageNet** dataset.
+
+We use `ImageNet` numbers in step 3 because in Section 6 we reuse a network pretrained on ImageNet, and a pretrained network expects its inputs scaled the same way as the training data.
+
+```{r transforms}
+imagenet_mean <- c(0.485, 0.456, 0.406) # manually pulled from the internet... "magic numbers" that you probably shouldn't trust normally
+imagenet_std  <- c(0.229, 0.224, 0.225)
+
+# transform for evaluation / training-from-scratch: deterministic resize + normalise
+eval_transform <- function(path) {
+  base_loader(path) |>            # H x W x C array in [0, 1]
+    transform_to_tensor() |>      # -> C x H x W float tensor
+    transform_resize(c(224, 224)) |>
+    transform_normalize(mean = imagenet_mean, std = imagenet_std)
+}
+```
+
+### 3.2 A `torch` dataset and dataloaders
+
+We need to do some special code to load our transformed data into a `torch` network for training. For efficiency, we train neural networks using "batches" of training data. This means we have it make predictions on a set of images/inputs all together and then update all the weights at once based on how well it did across the batch as a whole.
+
+```{r dataset}
+fundus_dataset <- dataset(
+  name = "FundusDataset",
+  initialize = function(df, transform) {
+    self$paths     <- df$path
+    # torch uses 1-based class indices, so referable {0,1} -> {1,2}
+    self$y         <- torch_tensor(df$referable + 1L, dtype = torch_long())
+    self$transform <- transform
+  },
+  .getitem = function(i) {
+    list(x = self$transform(self$paths[i]), y = self$y[i])
+  },
+  .length = function() {
+    length(self$paths)
+  }
+)
+
+train_df <- labels |> filter(split == "train")
+valid_df <- labels |> filter(split == "valid")
+test_df  <- labels |> filter(split == "test")
+
+train_ds <- fundus_dataset(train_df, eval_transform)
+valid_ds <- fundus_dataset(valid_df, eval_transform)
+test_ds  <- fundus_dataset(test_df,  eval_transform)
+
+batch_size   <- 16
+train_dl <- dataloader(train_ds, batch_size = batch_size, shuffle = TRUE)
+valid_dl <- dataloader(valid_ds, batch_size = batch_size, shuffle = FALSE)
+test_dl  <- dataloader(test_ds,  batch_size = batch_size, shuffle = FALSE)
+```
+
+Let's confirm the shape of one batch:
+
+```{r batch-shape}
+one_batch <- train_dl |> dataloader_make_iter() |> dataloader_next()
+dim(one_batch$x)   # expect: batch_size x 3 x 224 x 224
+```
+
+**Q5 (2 marks):** Explain what each of the four numbers in the batch dimension means. Why is the channel dimension `3` here? If, instead of CFP images, we were using a 3D MRI grayscale image that was 1000 pixels/voxels in each dimension, what would be the dimensions output by the above command?
+
+**Answer Q5:** Running `dim(one_batch$x)` outputs `16 3 224 224`. Each number means:
+
+- **16** — batch size: the number of images processed together in one training step
+- **3** — number of colour channels (Red, Green, Blue)
+- **224** — height of each image in pixels
+- **224** — width of each image in pixels
+
+The channel dimension is `3` because these are RGB colour fundus photographs. Colour matters here — retinal lesions like haemorrhages and exudates have distinctive colours that help separate them from healthy tissue.
+
+For a 3D MRI grayscale image at 1000 voxels in each dimension, the output would be `16 1 1000 1000 1000`. A 3D volume has an extra spatial dimension (depth) compared to a 2D image, so the tensor gains a fifth dimension. Since the MRI is grayscale there is only 1 channel. The five numbers represent: batch size × 1 channel (grayscale) × 1000 depth × 1000 height × 1000 width.
+
+**Q6 (1 marks):** If we didn't want to use pre-trained ImageNet networks then we would still probably want to normalise the intensities in our dataset. What issue might we cause if we normalised using the mean and standard deviation of the pixel intensities across the *whole* dataset (i.e., train, test, and validate combined)?
+
+**Answer Q6:** This would cause data leakage. By computing the mean and standard deviation using the test and validation sets, information from those held-out sets leaks into the preprocessing step. The model's training is then indirectly influenced by test data, which means test performance no longer gives a trustworthy estimate of how the model would perform on truly unseen data. The mean and standard deviation should be computed using the training set only, then applied to transform the validation and test sets.
+
+------------------------------------------------------------------------
+
+## 4 A CNN from Scratch
+
+We first train a small CNN *from scratch*, with no outside knowledge. Convolutions slide learnable filters across the image to capture local spatial patterns (see lecture); stacking convolutional layers, non-linearities (sigmoid/ReLUs), and pooling blocks builds up "increasingly higher-order learnt representations."
+
+### Why convolutions?
+
+A fully-connected layer would give every input pixel its own weight to every output unit. For a 224×224×3 image that is \~150,000 inputs *per output unit* far too many parameters to learn from a few thousand images. This would also ignore the important concept that pixels which are **near each other** in an image are related to one another. A **convolutional layer** enforce two structural assumptions that align with how images actually work:
+
+- **Locality.** Each output looks at only a small patch of the input - here a `kernel_size = 3` filter sees a 3×3 neighbourhood at a time. A learnable filter is just a small grid of weights that is multiplied element-wise with the patch and summed to a single number; sliding it across the whole image produces a *feature map* highlighting wherever the pattern encoded in the convolutional filter (an edge, a blob, a particular colour gradient) occurs.
+- **Weight sharing.** The *same* filter is reused at every position. So a filter that has learned to detect, say, a microaneurysm-like dark spot will fire wherever that spot appears - the network does not have to relearn it for every corner of the image. The fancy term for this is **translation equivariance**.
+
+Each conv layer learns *many* filters at once — the second number in `nn_conv2d(3, 16, …)` is the number of output filters, so this layer turns the 3 colour channels into **16 feature maps**. As we go deeper we ask for more filters (16 to 32 to 64) because later layers compose the simple early patterns into rarer, higher-order ones (e.g., edges to textures to specific lesion-shaped motifs). Each conv is followed by a `nn_relu()`, a simple `max(0, x)` nonlinearity like any normal neural network.
+
+### Why pooling?
+
+`nn_max_pool2d(2)` slides a 2×2 window across each feature map and keeps only the **maximum** value in each window, halving the height and width (so 224 to 112 to 56 …). This does three useful things:
+
+- **Translation *invariance*.** Once a filter has reported "an edge is present somewhere in this patch," we often do not care about its exact pixel position. Keeping the strongest response and discarding precise location makes the network robust to the lesion being shifted by a few pixels. This is useful, since fundus images are rarely perfectly aligned to one another (i.e., "registered").
+- **A growing receptive field.** After pooling, each value summarises a larger region of the original image, so the *next* 3×3 filter effectively "sees" a bigger area. This is how a stack of small filters can end up responding to large structures.
+- **Cheaper computation.** Halving the resolution quarters the number of values the next layer must process, which is what lets us afford more filters as we go deeper.
+
+The final `nn_adaptive_avg_pool2d(c(1, 1))` is **global average pooling**: it collapses each of the 64 feature maps to a single number corresponding to its average activation over the whole image. This length-64 summary vector finally feeds into the classifier part of network.
+
+We define this "simple" CNN using the following code:
+
+```{r scratch-cnn}
+simple_cnn <- nn_module(
+  "SimpleCNN",
+  initialize = function() {
+    self$features <- nn_sequential(
+      nn_conv2d(3, 16, kernel_size = 3, padding = 1), nn_relu(), nn_max_pool2d(2),
+      nn_conv2d(16, 32, kernel_size = 3, padding = 1), nn_relu(), nn_max_pool2d(2),
+      nn_conv2d(32, 64, kernel_size = 3, padding = 1), nn_relu(),
+      nn_adaptive_avg_pool2d(c(1, 1))   # global average pool -> 64 x 1 x 1
+    )
+    self$classifier <- nn_sequential(
+      nn_dropout(p = 0.5),
+      nn_linear(64, 2)                  # 2 logistic functions to get the probability of grade 0 and grade 4
+    )
+  },
+  forward = function(x) {
+    x <- self$features(x)
+    x <- torch_flatten(x, start_dim = 2)
+    self$classifier(x)
+  }
+)
+```
+
+We then use `luz` to wrap the training loop. It minimise cross-entropy and tracks accuracy on the separate validation set each time we train on all of our training data batches (also known as an epoch).
+
+```{r train-scratch, cache = TRUE}
+fitted_scratch <- simple_cnn |>
+  setup(
+    loss      = nn_cross_entropy_loss(),
+    optimizer = optim_adam,
+    metrics   = list(luz_metric_accuracy())
+  ) |>
+  fit(train_dl, epochs = 5, valid_data = valid_dl, verbose = FALSE)
+```
+
+```{r scratch-curves, fig.height = 3.2}
+luz::get_metrics(fitted_scratch) |>
+  ggplot(aes(epoch, value, colour = set)) +
+  geom_line() + geom_point() +
+  facet_wrap(~metric, scales = "free_y") +
+  labs(title = "Training-from-scratch learning curves",
+       x = "Epoch", y = NULL, colour = NULL)
+```
+
+**Q7 (2 marks):** Look at the validation accuracy and loss across epochs. Do you think small network is actually *learning* to separate referable from non-referable eyes, why or why not?
+
+**Answer Q7:** No, the small network is not learning. Running the training produces the following validation metrics across all 5 epochs:
+
+| Epoch | Valid Accuracy | Valid Loss |
+|-------|----------------|------------|
+| 1     | 0.7083         | 0.5533     |
+| 2     | 0.7083         | 0.5631     |
+| 3     | 0.7083         | 0.5508     |
+| 4     | 0.7083         | 0.5423     |
+| 5     | 0.7083         | 0.5534     |
+
+The validation accuracy is completely flat at 70.83% across every epoch and is not improving. This value matches almost exactly the proportion of healthy (majority class) images in the validation set (17 healthy out of 24 total = 70.8%), which means the model is simply predicting "healthy" for every image and never flagging DR. The validation loss also barely changes. Despite the training loss slowly decreasing, this has no effect on validation performance — the model has failed to learn any generalizable features for separating the two classes.
+
+## 5 Data Augmentation
+
+When real training data is scarce, **augmentation** synthesises plausible new examples by applying random transformations (i.e., inducing a prior on how we expect images to vary).
+
+```{r augmentation-demo, fig.width = 8, fig.height = 3}
+demo_path <- train_df$path[1]
+orig <- base_loader(demo_path) |> transform_to_tensor()
+
+show_tensor <- function(t, title) {
+  arr <- as.array(t$permute(c(2, 3, 1)))           # C,H,W -> H,W,C for plotting
+  arr <- (arr - min(arr)) / (max(arr) - min(arr))  # rescale to [0,1] for display
+  magick::image_ggplot(magick::image_read(as.raster(arr))) +
+    ggtitle(title) + theme(plot.title = element_text(size = 9))
+}
+
+aug1 <- orig |> transform_random_horizontal_flip(p = 1)
+aug2 <- orig |> transform_color_jitter(brightness = 0.4, contrast = 0.4)
+
+gridExtra::grid.arrange(
+  show_tensor(orig, "Original"),
+  show_tensor(aug1, "Horizontal flip"),
+  show_tensor(aug2, "Colour jitter"),
+  nrow = 1
+)
+```
+
+We add augmentation **only to the training pipeline** (never to validation/test - we evaluate on untouched images to avoid overfitting):
+
+```{r train-transform}
+train_transform <- function(path) {
+  base_loader(path) |>
+    transform_to_tensor() |>
+    transform_random_resized_crop(size = c(224, 224), scale = c(0.8, 1.0)) |>
+    transform_random_horizontal_flip(p = 0.5) |>
+    transform_color_jitter(brightness = 0.2, contrast = 0.2) |>
+    transform_normalize(mean = imagenet_mean, std = imagenet_std)
+}
+```
+
+**Q8a (2 marks):** These augmentations have some real potential drawbacks especially with data from eyes! Explain why flipping an eye horizontally may be misleading in this context then copy the above code to create a new augmentation pipeline `train_transform_fixed` which removes the horizontal flip and adds a *small random rotation* (`transform_random_rotation(degrees = ...)`). (Hint: use `?transform_random_rotation` to figure out the parameters for this function).
+
+**Answer Q8a:** Horizontally flipping a fundus image is misleading because it converts a left eye into an anatomically implausible right eye (or vice versa). The retina of the left and right eyes are mirror images — the optic disc and major vessel branching patterns appear on opposite sides. A horizontal flip creates an image that does not correspond to any real eye, which could teach the model incorrect spatial anatomy and may confuse it when it encounters real left or right eyes at test time. Small random rotations are a safer augmentation because eyes can naturally be photographed at slightly different angles.
+
+```{r q8-augment}
+train_transform_fixed <- function(path) {
+  base_loader(path) |>
+    transform_to_tensor() |>
+    transform_random_resized_crop(size = c(224, 224), scale = c(0.8, 1.0)) |>
+    transform_random_rotation(degrees = 15) |>
+    transform_color_jitter(brightness = 0.2, contrast = 0.2) |>
+    transform_normalize(mean = imagenet_mean, std = imagenet_std)
+}
+```
+
+Now apply your new augmentations - this will use the incorrect augmentations if you haven't completed Q8!
+
+```{r apply_augments}
+train_ds_aug <- fundus_dataset(train_df, train_transform)
+train_dl_aug <- dataloader(train_ds_aug, batch_size = batch_size, shuffle = TRUE)
+```
+
+Now we re-train the *exact same* `simple_cnn` from Section 4, changing only the data it sees: the augmented `train_dl_aug` in place of the un-augmented `train_dl`. Everything else (architecture, loss, optimiser, epochs) is held fixed so the comparison is like-for-like.
+
+```{r train-scratch-aug, cache = TRUE}
+fitted_scratch_aug <- simple_cnn |>
+  setup(
+    loss      = nn_cross_entropy_loss(),
+    optimizer = optim_adam,
+    metrics   = list(luz_metric_accuracy())
+  ) |>
+  fit(train_dl_aug, epochs = 5, valid_data = valid_dl, verbose = FALSE)
+```
+
+```{r scratch-aug-curves, fig.height = 3.2}
+bind_rows(
+  luz::get_metrics(fitted_scratch)     |> mutate(run = "No Augmentation"),
+  luz::get_metrics(fitted_scratch_aug) |> mutate(run = "Augmentation")
+) |>
+  filter(set == "valid") |>
+  ggplot(aes(epoch, value, colour = run)) +
+  geom_line() + geom_point() +
+  facet_wrap(~metric, scales = "free_y") +
+  labs(title = "Simple CNN: validation curves with vs without augmentation",
+       x = "Epoch", y = NULL, colour = NULL)
+```
+
+**Q8b (2 marks):** Compare the validation curves of the augmented and un-augmented runs of the *same* network. Did augmentation help, hurt, or make little difference here, and why might that be the case for a dataset and network of this size?
+
+**Answer Q8b:** Augmentation made virtually no difference. Both the augmented and un-augmented models produce identical validation accuracy of 70.83% across all 5 epochs, and their validation losses are similarly flat and nearly identical. This is because the network itself is simply too small and shallow to learn meaningful features from this dataset — as shown in Q7, both models are stuck predicting the majority class. Augmentation can only help if the model is actually capable of learning; if the underlying network cannot extract useful features, generating more varied versions of the same images does not help. The bottleneck here is model capacity and dataset size, not data variety.
+
+## 6 Transfer Learning
+
+Training from scratch on a few hundred images is hopeless. The breakthrough in **both** assigned papers was **transfer learning**: start from a network already trained on the 1.2-million-image, 1000-class [ImageNet](https://www.image-net.org/) dataset, keep its learned edge/texture/shape detectors, and only re-train the classification part of the network for our task.
+
+Here we load a pretrained **ResNet-18**, freeze its convolutional backbone, and replace its final fully-connected layer with a fresh 2-class head.
+
+```{r transfer-model}
+train_ds_aug <- fundus_dataset(train_df, train_transform)
+train_dl_aug <- dataloader(train_ds_aug, batch_size = batch_size, shuffle = TRUE)
+
+
+resnet_transfer <- nn_module(
+  "ResNetTransfer",
+  initialize = function() {
+    self$model <- model_resnet18(pretrained = TRUE)
+    # freeze the backbone: only the new head will be trained
+    for (par in self$model$parameters) par$requires_grad_(FALSE)
+    n_in <- self$model$fc$in_features
+    self$model$fc <- nn_linear(n_in, 2)   # new, trainable classification head
+  },
+  forward = function(x) {
+    self$model(x)
+  }
+)
+```
+
+```{r train-transfer, cache = TRUE}
+fitted_tl <- resnet_transfer |>
+  setup(
+    loss      = nn_cross_entropy_loss(),
+    optimizer = optim_adam,
+    metrics   = list(luz_metric_accuracy())
+  ) |>
+  fit(train_dl_aug, epochs = 5, valid_data = valid_dl, verbose = FALSE)
+```
+
+```{r transfer-curves, fig.height = 3.2}
+luz::get_metrics(fitted_tl) |>
+  ggplot(aes(epoch, value, colour = set)) +
+  geom_line() + geom_point() +
+  facet_wrap(~metric, scales = "free_y") +
+  labs(title = "Transfer-learning learning curves",
+       x = "Epoch", y = NULL, colour = NULL)
+```
+
+**Q9 (2 marks):** What is ImageNet, and why would convolution and pooling layers learnt on photos of cats, cars and mushrooms improve our ability to predict DR from CFP images (none of which are in the ImageNet dataset)?
+
+**Answer Q9:** ImageNet is a large-scale benchmark dataset containing over 1.2 million photographs across 1000 categories (animals, objects, vehicles, food, etc.), used to train and evaluate image classification models. The transfer learning model (ResNet-18 pretrained on ImageNet) reaches 95.83% validation accuracy by epoch 5, compared to the scratch CNN which never exceeded 70.83% — a dramatic improvement from using pretrained weights.
+
+The reason ImageNet-pretrained features transfer to fundus photographs is that the early and middle layers of a CNN learn general-purpose visual features — edges, textures, colour gradients, curves, blobs — that are useful for recognising structure in any natural image, not just the categories in ImageNet. Retinal features like haemorrhages (dark circular spots), exudates (bright patches), and vessel patterns (curved lines) are all composed of these same low-level building blocks. Rather than learning these basic features from scratch on only a few hundred fundus images, transfer learning gives the network a head start with high-quality feature detectors already in place, and only the final classification layer needs to be retrained for the DR task.
+
+## 7 Evaluating Like a Clinician
+
+Accuracy is misleading under class imbalance (Lab 1... may help with an earlier question in this lab...). Clinically, and in both papers, models are judged on the **ROC curve**, the **AUC**, and a choice of **operating point** trading off sensitivity (catching disease) against specificity (avoiding false alarms).
+
+We get predicted probabilities of grade 4 DR on the held-out test set:
+
+```{r predict-test}
+test_logits <- predict(fitted_tl, test_dl)
+test_probs  <- as.numeric(as.array(nnf_softmax(test_logits, dim = 2)[, 2]))
+
+eval_df <- test_df |>
+  mutate(
+    .pred_referable = test_probs,
+    truth = factor(referable, levels = c(1, 0),
+                   labels = c("Referable", "Not referable"))
+  )
+```
+
+```{r roc, fig.width = 5, fig.height = 4}
+yardstick::roc_auc(eval_df, truth, .pred_referable, event_level = "first")
+
+yardstick::roc_curve(eval_df, truth, .pred_referable, event_level = "first") |>
+  autoplot() +
+  labs(title = "ROC curve: referable DR (test set)")
+```
+
+A model with two outputs gives us a whole curve, so we can pick *operating points*. Gulshan et al. reported one tuned for **high specificity** and one for **high sensitivity**.
+
+**Q10 (2 marks):** Define sensitivity and specificity and explain how there is usual a trade-off between them. Which is more important in clinical screening program? Approximated using this ROC curve (dark line in plot above - just eyeball the value using the plot), how much specificity would you lose if you wanted perfect sensitivity? Similarly, how bad would the sensitivity be with perfect specificity?
+
+**Answer Q10:** Sensitivity is the proportion of true DR cases that the model correctly flags as referable (true positive rate). Specificity is the proportion of healthy eyes that the model correctly identifies as not referable (true negative rate).
+
+The trade-off arises because lowering the classification threshold causes the model to flag more cases as referable — catching more true positives (higher sensitivity) but also flagging more healthy eyes incorrectly (lower specificity). Raising the threshold does the opposite.
+
+In a clinical screening program, sensitivity is more important. Missing a true DR case (a false negative) means a patient with sight-threatening disease goes untreated, potentially leading to preventable blindness. An unnecessary referral of a healthy patient (a false positive) is far less harmful — just an extra clinical appointment.
+
+From the ROC curve results (AUC = 0.931), reading the curve points: - **Perfect sensitivity (1.0):** achieved at a threshold of approximately 0.138, where specificity drops to about 0.47. So you would lose roughly 53% of specificity to achieve perfect sensitivity. - **Perfect specificity (1.0):** would require a threshold so high that sensitivity drops to approximately 0 — the model would never flag any case as DR.
+
+## 8 Interpretability and Clinical Translation
+
+Good performance metrics are necessary but nowhere near sufficient for clinical use.
+
+**Interpretability.** Arcadu et al. did not stop at a number — they produced **attribution maps** (via guided back-propagation) showing *where* each network looked, and used **SHAP** to see which retinal fields drove the random-forest aggregation. Reassuringly, the maps lit up on microaneurysms, haemorrhages and exudates - the same lesions clinicians use.\
+Unfortunately, these sort of analysis methods proved a little too challenging to get working in a robust cross-platform way for this lab!
+
+**Q11 (1 marks):** Why is an attribution/saliency map more convincing evidence than test accuracy/sensitivity/specificity alone when arguing a model is clinically trustworthy? Give one way a model could achieve high performance metrics for the *wrong* reason that an attribution map might expose
+
+**Answer Q11:** Performance metrics only tell you *how well* a model predicts — they say nothing about *why*. A model could achieve high sensitivity and specificity by exploiting a spurious pattern in the data that happens to correlate with the label but has nothing to do with the actual disease. An attribution map shows *which pixels or regions* the model focused on when making its prediction, allowing clinicians to verify that it is attending to genuine retinal pathology (haemorrhages, exudates, neovascularization) rather than irrelevant artifacts.
+
+One example: a model could learn to predict severe DR based on image brightness or the position of the optic disc rather than lesions, because these features might differ systematically between the grade 0 and grade 4 subsets due to acquisition differences. The model would score well on the test set but would fail on any new dataset where those spurious correlations don't hold. An attribution map would expose this by showing the model highlighting the optic disc or image borders rather than haemorrhages.
+
+**Q12 (1 marks):** Gulshan et al. validated on **two** datasets, including the publicly available Messidor-2 (a *different* country, cameras and protocol). Why is this kind of *external* validation so much stronger evidence than a held-out split of the same data?
+
+**Answer Q12:** A held-out split from the same dataset shares the same camera, imaging protocol, patient population, grading team, and acquisition conditions as the training set. Any spurious patterns or biases present in the training data will also be present in the held-out split, so a model that has learned the wrong thing for the right reasons can still score well. External validation on a completely independent dataset from a different country, with different cameras and protocols, removes all of these shared confounders. If a model performs well on Messidor-2 despite never having seen images from that camera or population, it is much stronger evidence that the model has learned genuine features of diabetic retinopathy rather than artifacts of one particular imaging setup.
+
+## 9 Reproducibility
+
+```{r session-info, cache = FALSE}
+sessionInfo()
+```
