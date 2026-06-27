@@ -1,0 +1,968 @@
+---
+title: "Practical 4 - Physiological Signals: Detecting Atrial Fibrillation from the ECG"
+author: "Vivekkumar Dudhat"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    df_print: paged
+    theme: cosmo
+    highlight: tango
+    number_sections: false
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  message    = FALSE,
+  warning    = FALSE,
+  fig.align  = "center",
+  fig.width  = 7,
+  fig.height = 4,
+  dpi        = 110,
+  cache      = TRUE,
+  cache.lazy = FALSE
+)
+
+GLOBAL_SEED <- 42
+set.seed(GLOBAL_SEED)
+```
+
+> **Submission.** Knit your Rmd file into HTML and submit it via
+> Brightspace. Include a link to your git repository (GitHub or
+> git.cs.dal.ca) as a comment on your submission.
+
+------------------------------------------------------------------------
+
+## 0 Setup
+
+This lab uses a few different/new libraries to handle signal processing
+and to cover all 3 of our analysis paradigms for signal data: a
+**time-domain** model, a **frequency-domain** model, and a
+**state-space** model.
+
+```         
+install.packages(c(
+  "signal",      # digital filters (Butterworth band-pass / notch)
+  "forecast",    # ARIMA time-series models (auto.arima)
+  "depmixS4"     # Gaussian (continuous) hidden Markov models (state-space)
+))
+```
+
+If the block below runs without error you are ready to go. Instead of
+attaching like normal (using `library()`) we are just checking if
+`signal` and `forecast` are both installed (using `requiredNamespace`).
+This is these libraries contain functions (like `filter()`) that collide
+with each other and `dplyr`. Instead we will call both explicitly in the
+code with the `signal::` / `forecast::` prefix where needed.
+
+```{r packages}
+library(tidyverse)
+library(here)
+library(fs)
+library(depmixS4)
+library(yardstick)
+library(scales)
+requireNamespace('signal')
+requireNamespace('forecast')
+```
+
+------------------------------------------------------------------------
+
+## 1 Introduction
+
+The electrocardiogram (ECG) records the small voltages produced as the
+heart's chambers depolarise to contract (systole) and repolarise to
+relax (diastole).
+
+A single normal beat has a very distinctive/standard shape - the **P
+wave** (atrial contracting), the **QRS complex** (ventricular
+contracting), and the **T wave** (ventricular relaxing). The time
+between the main **R** spikes in successive QRS peaks is the **R-R
+interval**.
+
+When a heart doesn't beat in a nice regular rhythm we call this a
+cardiac arrhythmia. **Atrial fibrillation (AF)** is the most common
+sustained arrhythmia and a major cause of stroke and heart failure. As
+AF is often asymptomatic, a lot of work has gone into identifying it
+accurately from ECGs. Typically, AF is recognised in an ECG by the
+disappearance of the **P wave** (as the atria are contracting
+chaotically rather than in an organised wave) and irregular spacing and
+timing of the **QRS** complex (as the ventricles contract at irregular
+intervals).
+
+In this lab we will build a different AF detector for each signal data
+analysis paradigm and then compare them against one another:
+
+- a **time-domain** model that asks how predictable the next R-R
+  interval is (using **ARIMA** via `forecast::auto.arima`, the
+  autoregressive / moving-average / integrated family from the lecture),
+- a **frequency-domain** model that asks how the signal's energy is
+  spread across frequencies (using the Fourier transform), and
+- a **state-space** model that treats the rhythm as a sequence of hidden
+  states (a hidden Markov model).
+
+## 2 The Data
+
+We use a small prepared subset of the **MIT-BIH Atrial Fibrillation
+Database** (the same public PhysioNet database Babaeizadeh et al.
+validated on): two-channel Holter ECGs sampled at 250 Hz with expert
+beat and rhythm annotations. Reading the raw PhysioNet files needs some
+slightly awkward platform-specific libraries, so I've simplified things
+a little (including extract R-R intervals) and converted to a more
+usable format for you. We've also simplified away the "temporal
+dependence" complexity of how you cut-up time-series data to avoid
+misleading yourself.
+
+As in the earlier labs, we download a prepared archive once and cache
+it.
+
+```{r data-paths}
+data_dir  <- here("data")
+cache_dir <- fs::path(data_dir, "cache")
+fs::dir_create(cache_dir)
+
+data_url <- "https://maguire-lab.github.io/health_data_science_research_2026/static_files/practicals/ecg_afib.zip"
+zip_path <- fs::path(cache_dir, "ecg_afib.zip")
+ecg_root <- fs::path(data_dir, "ecg_afib")
+```
+
+```{r download-data, cache = TRUE}
+if (!fs::dir_exists(ecg_root)) {
+  if (!fs::file_exists(zip_path)) {
+    download.file(data_url, zip_path, mode = "wb", quiet = TRUE)
+  }
+  unzip(zip_path, exdir = data_dir)
+}
+
+fs::dir_ls(ecg_root)
+```
+
+The archive contains 2 tables:
+
+- `waveforms.csv` - a handful of 10-second raw ECG snippets (2500
+  samples each at 250 Hz), labelled `AF` or `Normal` where `record`
+  indicates an individual patient.
+- `rr_intervals.csv` - sequences of consecutive R-R intervals split into
+  fixed-length **windows** (128 beats each, roughly two minutes) and
+  labelled by rhythm.
+
+```{r load-data}
+waveforms <- read_csv(fs::path(ecg_root, "waveforms.csv")) |>
+  mutate(rhythm = factor(rhythm, levels = c("AF", "Normal")))
+
+rr <- read_csv(fs::path(ecg_root, "rr_intervals.csv")) |>
+  mutate(rhythm = factor(rhythm, levels = c("AF", "Normal")))
+
+glimpse(waveforms)
+glimpse(rr)
+```
+
+**Q1 (2 marks):** Write a short data dictionary for `waveforms` and `rr`
+with your best guess explanation of the values and format of these
+datasets.
+
+**Answer Q1:**
+
+| Column | Type | Description |
+|---------------------|------------------|---------------------------------|
+| `record` | string | Patient identifier from the MIT-BIH AF Database. There are 6 unique patients: `04015`, `04746`, `05121`, `06426`, `07879`, `08378`. |
+| `segment` | string | Unique identifier for a 10-second ECG snippet, formed as `<record>_<rhythm>` (e.g. `04015_Normal`). Each segment is one continuous clip from a single patient and rhythm. |
+| `rhythm` | factor | Expert-annotated rhythm label for the segment `"AF"` (atrial fibrillation) or `"Normal"` (sinus rhythm). Balanced: 15,000 rows per class. |
+| `time` | numeric | Time in seconds from the start of the segment (0.000 to 9.996 s, step = 0.004 s), reflecting the 250 Hz sampling rate. |
+| `ecg` | numeric | ECG voltage in millivolts (mV), ranging approximately 3.37 to +3.41 mV. Represents the bioelectrical signal recorded at the electrode capturing the heart's depolarisation and repolarisation cycles. |
+
+| Column | Type | Description |
+|---------------------|------------------|---------------------------------|
+| `record` | string | Same patient identifier as above (6 patients). |
+| `window` | integer | Index (0-based) of a non-overlapping 128-beat window within a record. Each window covers roughly two minutes of heartbeats and carries a single rhythm label. |
+| `rhythm` | factor | Expert-annotated rhythm label for the window `"AF"` or `"Normal"`. Imbalanced: approximately 34,000 AF beat rows versus 21,500 Normal beat rows. |
+| `beat` | integer | Beat number (0 based) within the window, ranging from 0 to 127. |
+| `rr` | numeric | R-R interval in seconds — the time elapsed between two successive R-peaks. Values range from approximately 0.20 s to 1.99 s (roughly 30–300 bpm). Intervals are shorter and highly irregular in AF; longer and more regular in Normal sinus rhythm. |
+
+## 3 Train / Test Split
+
+Before any cleaning or exploration we split the data, so that nothing we
+decide later can be influenced by the test set.
+
+We split on whole **records** and keep the train and test data in
+completely separate objects (`rr_train` / `rr_test` and
+`waveforms_train` / `waveforms_test`).
+
+```{r split}
+set.seed(GLOBAL_SEED)
+
+all_records  <- rr |> distinct(record) |> pull(record)
+test_records <- sample(all_records, size = round(0.3 * length(all_records)))
+
+rr_train <- rr |> filter(!record %in% test_records)
+rr_test  <- rr |> filter(record %in% test_records)
+
+waveforms_train <- waveforms |> filter(!record %in% test_records)
+waveforms_test  <- waveforms |> filter(record %in% test_records)
+
+bind_rows(
+  rr_train |> distinct(record, window, rhythm) |> mutate(split = "train"),
+  rr_test  |> distinct(record, window, rhythm) |> mutate(split = "test")
+) |>
+  count(split, rhythm)
+```
+
+**Q2 (2 marks):** Why do we split on the **record** instead of the
+**segment**? What could the models end up learning to recognise instead
+of AF if we split by **segment**?
+
+**Answer Q2:** We split by **record** (patient) rather than segment
+because each patient contributes multiple segments and windows. If we
+split by segment, the same patient's data would appear in both the
+training and test sets. Since every individual has a unique ECG
+signature their own baseline voltage level, QRS morphology, T-wave
+shape, and heart rate range. model could learn to identify the *patient*
+rather than the rhythm. It would then perform well on the test set not
+because it has learned what AF looks like, but because it has
+effectively memorised that patient's signal. This is a form of **data
+leakage**: the test set is no longer independent, and the reported
+performance is overly optimistic and would not generalise to new
+patients.
+
+Specifically, if split by segment, the models could learn to recognise
+individual patient identity (e.g., a distinctive QRS amplitude or
+baseline offset), or they could exploit the fact that AF and Normal
+segments from the same patient are recorded under similar conditions
+(same electrode placement, same recording session), meaning differences
+between classes are confounded with within-patient variation rather than
+true rhythm differences.
+
+## 4 Cleaning - Frequency Filtering
+
+Raw ECG is rarely analysis-ready. Two classic problems are **baseline
+wander** (slow drift from breathing and electrode movement, below the
+heartbeat frequency) and **mains interference**(a sharp hum at the
+power-line frequency - 60 Hz as these are US recordings - [table of
+national
+frequencies](https://www.wpowerproducts.com/power-generation-resources/voltages-and-frequencies-by-country/)).
+
+The lecture covered two standard fixes: a **band-pass** filter keeps
+only frequencies likely to be connected to heart bioelectical signals,
+and a **notch (band-stop)** filter removes narrow bands of interference
+like the **mains frequency**. The the actual way these filters are
+implemented varies a lot (with different nuances on how they
+flatten/amplify things). In this lab we implement the two filters using
+something called a [Butterworth
+filter](https://en.wikipedia.org/wiki/Butterworth_filter) from the
+`signal` and apply them using `filtfilt()` (which filters forwards and
+backwards so features are not shifted in time).
+
+```{r filtering, fig.width = 8, fig.height = 4.5}
+fs <- 250
+
+# keep things in conceivable "normal heart rate" range (0.5 Hz to 40 Hz) to smooth out high and low frequency noise 
+bandpass <- signal::butter(2, c(0.5, 40) / (fs / 2), type = "pass")
+
+# cut out 59-61Hz signal from the electrical grid
+notch    <- signal::butter(2, c(59, 61) / (fs / 2), type = "stop")
+
+example_wave <- waveforms_train |>
+  filter(rhythm == "Normal") |>
+  filter(segment == first(segment))
+
+cleaned <- example_wave |>
+  mutate(
+    bp_filtered = signal::filtfilt(bandpass, ecg),
+    filtered    = signal::filtfilt(notch, bp_filtered)
+  )
+
+cleaned |>
+  filter(time <= 4) |>
+  dplyr::select(time, Raw = ecg, Filtered = filtered) |>   # dplyr::select - MASS also exports select()
+  pivot_longer(c(Raw, Filtered), names_to = "stage", values_to = "ecg") |>
+  mutate(stage = factor(stage, levels = c("Raw", "Filtered"))) |>
+  ggplot(aes(time, ecg)) +
+  geom_line(linewidth = 0.3) +
+  facet_wrap(~stage, ncol = 1) +
+  labs(x = "Time (s)", y = "ECG (mV)",
+       title = "Before and after band-pass + notch filtering")
+```
+
+As we can see, this cleans things up a little (although isn't perfect)
+so now let's apply the **same** two filters to every waveform in both
+the training and test sets.
+
+We keep the original trace as `ecg_raw` and overwrite `ecg` with the
+cleaned signal.
+
+```{r apply-filter, cache = TRUE}
+clean_waveforms <- function(df) {
+  df |>
+    group_by(record, segment) |>
+    arrange(time, .by_group = TRUE) |>
+    mutate(
+      ecg_raw = ecg,
+      ecg     = signal::filtfilt(notch, signal::filtfilt(bandpass, ecg))
+    ) |>
+    ungroup()
+}
+
+waveforms_train <- clean_waveforms(waveforms_train)
+waveforms_test  <- clean_waveforms(waveforms_test)
+
+glimpse(waveforms_train)
+```
+
+**Q3 (1 marks):** As part of these filters we are dividing the sampling
+rate in half. What does fs/2 represent in terms of the signal we've
+captured?
+
+**Answer Q3:** `fs/2` is the **Nyquist frequency** — the highest
+frequency that can be faithfully represented in a signal sampled at rate
+`fs`. At 250 Hz, `fs/2 = 125 Hz`. By the Nyquist theorem, to capture a
+frequency without aliasing (where high-frequency content folds back and
+appears as a false lower frequency), you must sample at least twice as
+fast as that frequency. Dividing filter cutoffs by `fs/2` normalises
+them to the range [0, 1], where 1 corresponds to the absolute maximum
+frequency the recording can contain. So a band-pass cutoff of
+`0.5 / (fs/2)` means "keep frequencies above 0.5 Hz" and `40 / (fs/2)`
+means "keep frequencies below 40 Hz" both well within the 125 Hz limit
+of this 250 Hz recording.
+
+## 5 Exploratory Data Analysis
+
+Remember, we only explore the **training set**!
+
+### 5.1 Class balance and a first look
+
+```{r eda-balance, fig.height = 3}
+rr_train |>
+  distinct(record, window, rhythm) |>
+  count(rhythm) |>
+  ggplot(aes(rhythm, n, fill = rhythm)) +
+  geom_col(show.legend = FALSE) +
+  scale_fill_manual(values = c("AF" = "firebrick", "Normal" = "grey60")) +
+  labs(x = NULL, y = "Number of windows (train)", title = "Window class balance")
+```
+
+A normal and an AF waveform snippet side by side - note the slightly
+more regular spacing in the Normal vs AF signal; the p-wave feature is
+less obviously different in this case:
+
+```{r eda-waveforms, fig.width = 8, fig.height = 4}
+waveforms_train |>
+  filter(time <= 4) |>
+  group_by(rhythm) |>
+  filter(segment == first(segment)) |>
+  ungroup() |>
+  ggplot(aes(time, ecg)) +
+  geom_line(linewidth = 0.3) +
+  facet_wrap(~rhythm, ncol = 1) +
+  labs(x = "Time (s)", y = "ECG (mV)", title = "Normal vs AF (training examples)")
+```
+
+### 5.2 Heart-rate-variability features
+
+A few standard summaries of each window's R-R series:
+
+```{r eda-hrv}
+window_features <- rr_train |>
+  group_by(record, window, rhythm) |>
+  summarise(
+    mean_rr = mean(rr),                       # average interval (1 / mean_rr = mean rate)
+    sdnn    = sd(rr),                          # overall variability
+    .groups = "drop"
+  )
+
+window_features |>
+  pivot_longer(c(mean_rr, sdnn),
+               names_to = "feature", values_to = "value") |>
+  ggplot(aes(rhythm, value, fill = rhythm)) +
+  geom_boxplot(show.legend = FALSE) +
+  facet_wrap(~feature, scales = "free_y") +
+  scale_fill_manual(values = c("AF" = "firebrick", "Normal" = "grey60")) +
+  labs(x = NULL, y = NULL, title = "HRV features by rhythm (train)")
+```
+
+**Q4 (2 marks):** Explain what this plot tells you about the R-R
+intervals in Normal vs AF samples.
+
+**Answer Q4:** The plot shows two boxplots — `mean_rr` (average R-R
+interval per window) and `sdnn` (standard deviation of R-R intervals per
+window) — split by rhythm.
+
+For **`mean_rr`**, the AF and Normal distributions overlap considerably,
+though AF windows tend to have slightly shorter mean intervals on
+average, reflecting the faster and more chaotic ventricular rate typical
+of AF. However, the overlap means `mean_rr` alone is not a reliable
+separator of the two classes.
+
+For **`sdnn`**, there is a much clearer separation: AF windows have
+substantially higher standard deviations than Normal windows. This
+directly captures the hallmark of AF — the highly irregular beat-to-beat
+timing. Normal sinus rhythm intervals cluster tightly around a
+consistent mean (low SDNN), while AF intervals jump erratically from
+beat to beat (high SDNN). The `sdnn` feature is therefore far more
+discriminative than `mean_rr` for distinguishing AF from Normal, and
+this irregularity is exactly what all three models in this lab aim to
+exploit.
+
+## 6 Time Domain Model (ARIMA)
+
+To detect AF with a time-domain approach we are going to work out **how
+predictable is the next interval given the preceding one(s) across each
+window?**. A regular sinus rhythm is highly predictable, so our model
+should be able to forecast the next intervals well; whereas an AF window
+is close to noise, so the forecast error is large. This means we can use
+our model's **forecast error as the AF score**.
+
+We'll use an ARIMA model to do this. ARIMA predicts the next value from
+a linear combination of recent values (the AR - autoregressive part) and
+recent forecast errors (the MA - moving average part), after
+differencing the series to make it stationary (the I part).\
+Specifically, we are going to use `forecast::auto.arima()` to
+automatically select (hyperparameter optimisation) how many previous
+values to use for each part of this model (also known as the "order" of
+the model component).
+
+For each window we treat the R-R series as a tachogram (interval value
+indexed by beat number), fit ARIMA on the first 80% of beats, forecast
+the rest, and record the mean absolute error.
+
+```{r arima-helper}
+arima_error <- function(window_df) {
+  y   <- window_df$rr
+  h   <- max(5, round(0.2 * length(y)))   # forecast horizon = last 20% of beats
+  cut <- length(y) - h
+
+  fit      <- forecast::auto.arima(y[seq_len(cut)])
+  forecast <- forecast::forecast(fit, h = h)
+  mean(abs(as.numeric(forecast$mean) - y[(cut + 1):length(y)]))   # forecast MAE
+}
+```
+
+Here is the idea on one window of each rhythm - the red forecast tracks
+the regular rhythm closely but cannot keep up with AF:
+
+```{r arima-demo, fig.width = 8, fig.height = 3.4}
+demo <- rr_train |>
+  group_by(rhythm) |>
+  filter(window == last(window)) |>
+  ungroup()
+
+demo_forecast <- demo |>
+  group_by(rhythm) |>
+  group_modify(~ {
+    y <- .x$rr
+    h <- max(5, round(0.2 * length(y)))
+    cut <- length(y) - h
+    fit <- forecast::auto.arima(y[seq_len(cut)])
+    fc  <- forecast::forecast(fit, h = h)
+    tibble(beat     = seq_along(y),
+           rr       = y,
+           forecast = c(rep(NA_real_, cut), as.numeric(fc$mean)))
+  }) |>
+  ungroup()
+
+# forecast error (mean absolute error over the forecast horizon) for each rhythm
+demo_error <- demo_forecast |>
+  filter(!is.na(forecast)) |>
+  group_by(rhythm) |>
+  summarise(mae = mean(abs(forecast - rr)), .groups = "drop") |>
+  mutate(label = paste0("MAE = ", round(mae, 3), " s"))
+
+ggplot(demo_forecast, aes(beat)) +
+  geom_line(aes(y = rr), linewidth = 0.3) +
+  geom_point(aes(y = rr), size = 0.5) +
+  geom_line(aes(y = forecast), colour = "firebrick", linewidth = 0.6, na.rm = TRUE) +
+  geom_text(data = demo_error, aes(x = Inf, y = Inf, label = label),
+            hjust = 1.1, vjust = 1.5, size = 3.5, inherit.aes = FALSE) +
+  facet_wrap(~rhythm, scales = "free_x") +
+  labs(x = "Beat number", y = "R-R interval (s)",
+       title = "ARIMA forecast (Red) vs Actual")
+```
+
+We build a per-window key table and a matching list of windows for the
+**train** and **test** sets separately. Each model below scores both
+sets - we look at the training scores to sanity-check that the score
+separates the classes, and keep the test scores untouched/unviewed for
+the final evaluation at the end. Now score every window. This fits one
+ARIMA model per window; it is cached so it only re-runs if the data
+changes.
+
+```{r window-setup, cache = TRUE}
+train_grp  <- rr_train |> group_by(record, window, rhythm)
+train_keys <- group_keys(train_grp)
+train_list <- group_split(train_grp)
+
+test_grp  <- rr_test |> group_by(record, window, rhythm)
+test_keys <- group_keys(test_grp)
+test_list <- group_split(test_grp)
+
+train_keys$arima_err <- map_dbl(train_list, arima_error)
+test_keys$arima_err  <- map_dbl(test_list, arima_error)
+
+```
+
+Now we can compare the forecast error in Normal vs AF across our
+training set:
+
+```{r arima-scores-show}
+train_keys |>
+  group_by(rhythm) |>
+  summarise(mean_forecast_error = mean(arima_err), .groups = "drop")
+```
+
+The mean error is higher for AF, but how well does the forecast error
+*alone* separate AF from Normal? We are treating `arima_err` directly as
+an AF score (larger = more AF-like). To make a prediction of AF vs
+Normal we to pick a threshold score i.e., if `arima_err` is greater than
+threshold we predict AF and below Normal.
+
+To do this we look at the **ROC curve**, which traces sensitivity
+against 1 - specificity as we sweep the detection threshold across every
+value of `arima_err`. We then pick the threshold value that maximises
+the Area Under the Curve (or **AUC**).
+
+```{r arima-roc, fig.width = 5, fig.height = 5}
+train_keys |>
+  roc_curve(truth = rhythm, arima_err, event_level = "first") |>
+  autoplot() +
+  labs(title = "ROC: ARIMA forecast error as an AF detector (train)")
+
+train_keys |>
+  roc_auc(truth = rhythm, arima_err, event_level = "first")
+```
+
+**Q5 (1 marks):** What other type of curve could we use to select the
+threshold? (Hint: think back to earlier labs)
+
+**Answer Q5:** We could use a **precision-recall (PR) curve**, which
+plots precision (positive predictive value) against recall (sensitivity)
+across all possible thresholds. Unlike the ROC curve, the PR curve is
+more informative under class imbalance. It directly shows the trade-off
+between how many predicted AF cases are correct (precision) and how many
+true AF cases are caught (recall). The threshold that maximises the **F1
+score** (the harmonic mean of precision and recall) is a common
+operating point choice from the PR curve.
+
+## 7 Frequency Domain
+
+The frequency-domain formulation we are going to use is **does AF and
+Normal signals have distinguishable amounts of different frequencies in
+their signals?**
+
+We can infer the frequency distribution of a signal using the Fourier
+transform (base R's `fft()`). A regular rhythm varies slowly (its R-R
+series wanders gently with breathing), so we expect its energy sits at
+*low* frequencies in a single concentrated peak. AF jumps from beat to
+beat, so its energy spreads out and up into *higher* frequencies. Rather
+than collapse this into one hand-picked score, we summarise each
+window's spectrum with **a handful of frequency-space features** and
+then let a **logistic regression** learn how to weight them.
+
+For each window we compute four interpretable frequency statistics:
+
+- `hf_frac` - fraction of power in the **upper half** of the band (AF
+  pushes power up here),
+- `spectral_centroid` - the power-weighted **mean frequency bin** (the
+  spectrum's "centre of mass"; higher for AF),
+- `spectral_entropy` - how **spread out / noisy** the spectrum is,
+  normalised to `[0, 1]` (a flat, broadband AF spectrum scores near 1; a
+  single sharp peak scores near 0),
+- `peak_frac` - the share of power in the **single biggest bin** (a
+  regular rhythm concentrates power in one peak, so this is high for
+  Normal).
+
+```{r freq-features}
+freq_features <- function(rr) {
+  x     <- rr - mean(rr)                       # remove the DC offset
+  n     <- length(x)
+  power <- (Mod(fft(x))^2)[2:floor(n / 2)]     # one-sided power, dropping the DC term
+  if (sum(power) == 0) {
+    return(tibble(hf_frac = 0, spectral_centroid = 0,
+                  spectral_entropy = 0, peak_frac = 0))
+  }
+  k    <- length(power)
+  bins <- seq_len(k)
+  p    <- power / sum(power)                    # spectrum as a probability distribution
+
+  tibble(
+    hf_frac           = sum(power[round(k / 2):k]) / sum(power),
+    spectral_centroid = sum(bins * p),
+    spectral_entropy  = -sum(p * log(p + 1e-12)) / log(k),
+    peak_frac         = max(p)
+  )
+}
+
+# attach the features to each window's key table. Assigning by column name
+# overwrites any existing copies, so re-running this block never duplicates or
+# mangles column names (unlike bind_cols).
+train_feats <- map_dfr(train_list, ~ freq_features(.x$rr))
+test_feats  <- map_dfr(test_list,  ~ freq_features(.x$rr))
+
+train_keys[names(train_feats)] <- train_feats
+test_keys[names(test_feats)]   <- test_feats
+
+train_keys |>
+  group_by(rhythm) |>
+  summarise(across(c(hf_frac, spectral_centroid, spectral_entropy, peak_frac), mean),
+            .groups = "drop")
+```
+
+Now we fit a simple logistic regression that predicts the probability a
+window is **AF** from those four features, using the **training**
+windows only. The fitted probability is the frequency model's AF score
+(`freq_prob`).
+
+```{r freq-logreg}
+freq_model <- glm(
+  (rhythm == "AF") ~ hf_frac + spectral_centroid + spectral_entropy + peak_frac,
+  family = binomial,
+  data   = train_keys
+)
+
+summary(freq_model)
+
+# predicted probability of AF for every window
+train_keys$freq_prob <- predict(freq_model, type = "response")
+test_keys$freq_prob  <- predict(freq_model, newdata = test_keys, type = "response")
+```
+
+**Q6 (2 marks)** Based on the output from summary above which
+frequency-based features are the best predictors of AF in this dataset?
+Does this match our hypotheses (above) for what each of these features
+will capture?
+
+**Answer Q6:** In the logistic regression summary, the best predictors
+are identified by the smallest p-values and the largest absolute
+z-values. Based on both the model output and the hypotheses laid out
+above:
+
+- **`spectral_entropy`** is the strongest predictor. It has a large
+  positive coefficient and a highly significant p-value, reflecting that
+  AF windows have a broadly spread, near-uniform spectrum (entropy near
+  1) while Normal windows concentrate power in a single peak (entropy
+  near 0). This matches the hypothesis exactly.
+- **`peak_frac`** is also a strong predictor with a large negative
+  coefficient. Normal rhythms concentrate most power in one dominant
+  frequency bin (high `peak_frac`), whereas AF spreads it across many
+  bins (low `peak_frac`). This is effectively the mirror image of
+  `spectral_entropy` and also matches the hypothesis.
+- **`hf_frac`** and **`spectral_centroid`** tend to be less significant
+  or only marginally significant. This is partly because AF pushes some
+  energy to higher frequencies, but the effect is weaker and partially
+  captured by `spectral_entropy` already (the features are correlated).
+  The hypothesis that AF shifts energy upward is directionally correct
+  but these features add less unique information once entropy and peak
+  fraction are in the model.
+
+Overall the results match the hypotheses well: the features that most
+directly capture rhythm irregularity (entropy, peak concentration)
+outperform those that capture frequency location (centroid,
+high-frequency fraction).
+
+Similarly to the time-based model above, we have to pick a threshold on
+the logistic regression output to decide when to make a prediction of
+AF. We can sweep possible thresholds from 0 to 1 to again trace out the
+**ROC curve**. Each point is one cut-off for calling a window AF; the
+dashed diagonal is chance, and the more the curve bows towards the
+top-left the better the model separates AF from Normal:
+
+```{r freq-roc, fig.width = 5, fig.height = 5}
+train_keys |>
+  roc_curve(truth = rhythm, freq_prob, event_level = "first") |>
+  autoplot() +
+  labs(title = "ROC: logistic-regression frequency detector (train)")
+
+train_keys |>
+  roc_auc(truth = rhythm, freq_prob, event_level = "first")
+
+```
+
+**Q7 (1 mark)**: What does it mean for the ROC curve to be below the
+dotted line?
+
+**Answer Q7:** The dotted diagonal line on a ROC curve represents the
+performance of a **random classifier** (AUC = 0.5) — one that assigns
+scores with no relationship to the true class. A curve that falls
+*below* this line means the model is performing **worse than random
+chance**: it is systematically assigning higher scores to Normal windows
+and lower scores to AF windows, i.e., the scoring direction is inverted.
+This does not mean the model has learned nothing. it has actually
+learned a real signal, but got the direction backwards. Flipping all
+predictions (predicting AF when the score is low and Normal when it is
+high) would produce a curve that mirrors above the diagonal and would
+perform better than random.
+
+## 8 State Space (Hidden Markov Model)
+
+The state-space model formulation is: **what sequence of hidden states
+best explains the observed intervals?** where the rhythm moves between
+unobserved states that each emit specific intervals with different
+probabilities.
+
+Rather than discretising each interval into a symbol, we model the
+**interval values directly** as continuous series of emitted values. We
+fit a two-state HMM on all the training windows using `depmixS4`. With
+two hidden states the model tends to discover one "regular" state
+(intervals tightly clustered around a mean) and one "irregular" state (a
+broad, high-variance distribution). Crucially we never show it the
+AF/Normal labels - the states in this case are learned purely from the
+distribution of R-R intervals.
+
+```{r hmm-train, cache = TRUE}
+# concatenate the training windows into one series, recording each window's length
+# so depmixS4 treats the windows as separate sequences (the ntimes argument)
+train_seq    <- bind_rows(train_list)
+ntimes_train <- map_int(train_list, nrow)
+
+hmm_spec <- depmix(rr ~ 1, data = train_seq, nstates = 2,
+                   family = gaussian(), ntimes = ntimes_train)
+hmm_fit  <- fit(hmm_spec, verbose = FALSE)
+
+summary(hmm_fit)
+```
+
+The two states differ in their emission distributions - one has a much
+larger standard deviation (the AF-like, irregular state). We use the
+**training labels** only to decide *which* hidden state that is: the
+state that accounts for most of the beats occurring in AF windows.
+
+```{r hmm-af-state}
+train_states <- posterior(hmm_fit, type = "viterbi")$state   # decoded state per beat
+
+af_state <- tibble(rhythm = train_seq$rhythm, state = train_states) |>
+  count(state, rhythm) |>
+  group_by(state) |>
+  summarise(af_frac = sum(n[rhythm == "AF"]) / sum(n), .groups = "drop") |>
+  slice_max(af_frac, n = 1, with_ties = FALSE) |>
+  pull(state)
+```
+
+Now to label a whole **window** we infer the underlying hidden states
+across the window and look at how much of it sits in the AF state. The
+*fraction* of a window's beats in the AF state is a natural continuous
+AF score; a simple majority vote would threshold it at 0.5, but below we
+instead fit the best threshold from an ROC curve (below).
+
+For new (test) data, `depmixS4` predicts by building a model with the
+same structure, copying the fitted parameters into it, and decoding - it
+does not re-estimate anything:
+
+```{r hmm-score}
+# Viterbi-decode a list of windows under an already-fitted model
+decode_states <- function(window_list, fitted) {
+  seq_df <- bind_rows(window_list)
+  spec   <- depmix(rr ~ 1, data = seq_df, nstates = 2,
+                   family = gaussian(), ntimes = map_int(window_list, nrow))
+  spec   <- setpars(spec, getpars(fitted))   # reuse the trained parameters
+  posterior(spec, type = "viterbi")$state
+}
+
+# fraction of each window's beats that fall in the AF state
+af_fraction <- function(states, window_list) {
+  idx <- rep(seq_along(window_list), map_int(window_list, nrow))
+  as.numeric(tapply(states == af_state, idx, mean))
+}
+
+train_keys$hmm_score <- af_fraction(train_states, train_list)
+test_keys$hmm_score  <- af_fraction(decode_states(test_list, hmm_fit), test_list)
+```
+
+Now let's fit the threshold we are going to use to determine how much of
+a window should be in the AF state to classify the window as AF.
+
+```{r hmm-roc, fig.width = 5, fig.height = 5}
+roc_hmm <- train_keys |>
+  roc_curve(truth = rhythm, hmm_score, event_level = "first")
+
+hmm_threshold <- roc_hmm |>
+  mutate(youden = sensitivity + specificity - 1) |>
+  slice_max(youden, n = 1, with_ties = FALSE)
+
+hmm_threshold
+
+autoplot(roc_hmm) +
+  geom_point(data = hmm_threshold,
+             aes(x = 1 - specificity, y = sensitivity),
+             colour = "firebrick", size = 3) +
+  labs(title = "ROC: HMM AF-state fraction as a detector (train)",
+       subtitle = paste0("Chosen threshold (max Youden's J) = ",
+                         round(hmm_threshold$.threshold, 3)))
+```
+
+We then label every window by comparing its AF-state fraction to that
+fitted threshold:
+
+```{r hmm-predict}
+label_hmm <- function(df) {
+  df |> mutate(hmm_pred = factor(if_else(hmm_score >= hmm_threshold$.threshold,
+                                         "AF", "Normal"),
+                                 levels = c("AF", "Normal")))
+}
+train_keys <- label_hmm(train_keys)
+test_keys  <- label_hmm(test_keys)
+```
+
+How well does that rule separate the rhythms on the training windows?
+
+```{r hmm-confusion}
+train_keys |>
+  conf_mat(truth = rhythm, estimate = hmm_pred)
+```
+
+**Q8 (2 marks):** In this HMM, what is *observed* and what is *hidden*?
+
+**Answer Q8:** In this HMM, the **observed** variable is the sequence of
+**R-R interval values** (`rr`) — the actual measured times in seconds
+between consecutive heartbeats. These are the numbers the model directly
+receives as input for each window. The **hidden** variable is the
+**underlying rhythm state** at each beat one of two discrete latent
+states (state 1 or state 2) that the model infers but never directly
+observes. The model learns that one state emits R-R intervals drawn from
+a tight Gaussian distribution (low mean, low variance corresponding to a
+regular, Normal sinus rhythm) and the other state emits intervals from a
+broader Gaussian (higher variance corresponding to the irregular
+beat-to-beat timing of AF). Crucially, the model is never given the
+AF/Normal labels during training; it discovers these two states purely
+from the shape of the interval distributions. The rhythm labels are only
+used *after* fitting, to determine which of the two learned states
+corresponds to AF.
+
+## 9 Comparing the Three Detectors
+
+Each model gives every window a score where larger means more AF-like.
+To compare them fairly we rescale each score to `[0, 1]` (so they share
+an axis) and evaluate on the **held-out test records**. The **ROC
+curve** and its **AUC** summarise how well each score separates AF from
+normal across all possible cut-offs - the same yardstick both papers
+report.
+
+```{r compare, fig.width = 6, fig.height = 4.5}
+test_scored <- test_keys |>
+  mutate(across(c(arima_err, freq_prob, hmm_score), rescale)) |>   # higher = more AF
+  pivot_longer(c(arima_err, freq_prob, hmm_score),
+               names_to = "model", values_to = "score") |>
+  mutate(
+    model = recode(model,
+                   arima_err = "Time (ARIMA)",
+                   freq_prob = "Frequency (logistic regression)",
+                   hmm_score = "State-space (HMM)"),
+    truth = factor(rhythm, levels = c("AF", "Normal"))
+  )
+
+# ROC curves, all three models on one set of axes
+test_scored |>
+  group_by(model) |>
+  roc_curve(truth, score, event_level = "first") |>
+  autoplot() +
+  labs(title = "ROC: three AF detectors on the test set")
+```
+
+```{r compare-auc}
+test_scored |>
+  group_by(model) |>
+  roc_auc(truth, score, event_level = "first") |>
+  dplyr::select(model, .estimate) |>   # dplyr::select - MASS (via depmixS4) also exports select()
+  arrange(desc(.estimate))
+```
+
+**Q9 (2 marks):** How do these models compare to one another?
+
+**Answer Q9:** Comparing the three models on the held-out test set using
+AUC (from the `compare-auc` chunk, arranged in descending order):
+
+- The **State-space (HMM)** model typically achieves the highest AUC.
+  This makes sense because it explicitly models the *sequential
+  structure* of R-R intervals. it asks which hidden state each beat
+  belongs to and uses the full temporal pattern of state transitions
+  across the window rather than a single summary statistic.
+- The **Frequency-domain (logistic regression)** model performs strongly
+  as well. By capturing four complementary spectral features (entropy,
+  peak concentration, centroid, high-frequency fraction), it summarises
+  the broadband irregularity of AF effectively. Its performance is close
+  to the HMM because spectral entropy and peak fraction are highly
+  informative on their own.
+- The **Time-domain (ARIMA)** model generally achieves a lower AUC than
+  the other two. While the forecast error does separate AF from Normal
+  (AF windows are harder to predict), ARIMA reduces each window to a
+  single scalar (mean absolute forecast error) and may not fully capture
+  the nature of AF irregularity compared to the feature-rich frequency
+  model or the sequence-aware HMM.
+
+All three models should comfortably outperform the random baseline (AUC
+= 0.5), demonstrating that each of the three signal analysis paradigms
+time-domain, frequency-domain, and state-space captures meaningful
+information about AF rhythm.
+
+**Q10 (3 marks):** Suggest a way we could improve each of these models
+performance and suggest at least 3 additional analyses that it would be
+a good idea to perform before trying to use these in the real-world.
+
+**Answer Q10:**
+
+**Model improvements:**
+
+- **Time-domain (ARIMA):** Rather than collapsing a whole window to a
+  single forecast MAE, we could extract richer time-domain HRV features
+  per window such as RMSSD (root mean square of successive differences),
+  pNN50 (proportion of successive intervals differing by more than 50
+  ms), and the coefficient of variation and feed them into a logistic
+  regression or random forest. These are established clinical HRV
+  metrics that more completely characterise beat-to-beat irregularity
+  than ARIMA forecast error alone.
+
+- **Frequency-domain (logistic regression):** The current features are
+  all derived from the R-R interval tachogram. A direct improvement
+  would be to compute frequency features from the **raw ECG waveform**
+  (using `waveforms`) rather than the R-R series, which would capture
+  the loss of the P wave a hallmark of AF alongside spectral
+  irregularity. Additionally, replacing logistic regression with a more
+  powerful classifier (e.g., random forest or gradient boosted trees)
+  would allow non-linear interactions between features to be exploited.
+
+- **State-space (HMM):** The current model uses only two states and a
+  single observed variable (`rr`). Performance could be improved by
+  increasing the number of states to capture transitional rhythms, or by
+  building a **multivariate HMM** that jointly models R-R intervals
+  alongside additional features (e.g., QRS duration or amplitude derived
+  from the waveform). A deep learning alternative such as an LSTM, which
+  models long-range sequential dependencies, would likely outperform a
+  Gaussian HMM on longer recordings.
+
+**Additional real-world analyses:**
+
+1.  **External validation on an independent dataset.** All three models
+    were trained and tested on a single database (MIT-BIH AFIB). Before
+    clinical use, they should be evaluated on data from a different
+    institution, country, or device type to assess whether performance
+    generalises beyond the specific recording conditions, patient
+    population, and annotation protocol of this dataset.
+
+2.  **Subgroup analysis.** AF presentation and ECG morphology can differ
+    by age, sex, and comorbidities (e.g., heart failure, diabetes).
+    Performance should be broken down by patient subgroup to check that
+    no group is systematically disadvantaged a model with strong overall
+    AUC can still perform poorly on elderly patients or those with
+    co-existing arrhythmias.
+
+3.  **Clinical operating point and calibration analysis.** AUC
+    summarises performance across all thresholds but clinicians need to
+    operate at one specific threshold. A full sensitivity/specificity
+    analysis at clinically meaningful operating points (e.g., targeting
+    ≥ 90% sensitivity for a screening tool) is needed, along with
+    calibration curves to verify that predicted probabilities actually
+    reflect true AF likelihood a model can have high AUC but poorly
+    calibrated probabilities, which matters if the score is used to
+    triage urgency of referral.
+
+------------------------------------------------------------------------
+
+## Reproducibility
+
+```{r session-info, cache = FALSE}
+sessionInfo()
+```
